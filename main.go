@@ -4,12 +4,17 @@ import (
 	"fmt"
 	"github.com/akamensky/argparse"
 	"github.com/barasher/go-exiftool"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
+
+var p = message.NewPrinter(language.English)
 
 type ProgramOptions struct {
 	DebugMode            bool     `json:"debug_mode"`
@@ -27,15 +32,20 @@ type PathInfo struct {
 }
 
 type RawfileInfo struct {
-	Paths         PathInfo
-	FilesizeBytes int
-	Timestamp     time.Time
+	Paths                   PathInfo
+	BaseFilename            string
+	FilesizeBytes           int
+	Timestamp               time.Time
+	OutputRelativeDirectory string
+	OutputRelativePath      string
 }
 
 type timestampForRelativePath struct {
 	relativePath      string
 	computedTimestamp time.Time
 }
+
+type SourceManifests map[string][]RawfileInfo
 
 func parseArgs() ProgramOptions {
 	parser := argparse.NewParser("", "Photo end of day script")
@@ -121,12 +131,18 @@ func scanSourceDirForImages(sourceDir string, programOpts ProgramOptions) []Rawf
 				return nil
 			}
 
+			// Make sure it ends with proper extension
+			if !strings.HasSuffix(strings.ToLower(info.Name()), "."+programOpts.FilenameExtension) {
+				return nil
+			}
+
 			newRawfile := RawfileInfo{
 				Paths: PathInfo{
 					path,
 					strings.TrimPrefix(path, sourceDir+"\\"),
 				},
 				FilesizeBytes: int(info.Size()),
+				BaseFilename:  info.Name(),
 			}
 			foundFiles = append(foundFiles, newRawfile)
 			return nil
@@ -143,7 +159,7 @@ func scanSourceDirForImages(sourceDir string, programOpts ProgramOptions) []Rawf
 	return foundFiles
 }
 
-func createReverseMap(fileManifests map[string][]RawfileInfo) map[string][]*RawfileInfo {
+func createReverseMap(fileManifests SourceManifests) map[string][]*RawfileInfo {
 	relativeToAbsoluteMap := make(map[string][]*RawfileInfo)
 
 	// Create a map keyed by relative path, value is array of all the absolute paths that
@@ -168,8 +184,8 @@ func createReverseMap(fileManifests map[string][]RawfileInfo) map[string][]*Rawf
 
 }
 
-func timestampWorker(workerName string, timestampRequestChannel chan RawfileInfo,
-	timestampComputedChannel chan timestampForRelativePath) {
+func timestampWorker(_ string, timestampRequestChannel chan RawfileInfo,
+	timestampComputedChannel chan timestampForRelativePath, wg *sync.WaitGroup) {
 
 	//fmt.Printf("Worker %s starting\n", workerName)
 
@@ -178,12 +194,15 @@ func timestampWorker(workerName string, timestampRequestChannel chan RawfileInfo
 		panic(err)
 	}
 
-	defer et.Close()
-
 	datetimeFormatString := "2006-01-02 15:04:05"
 
 	for {
-		currEntryToTimestamp := <-timestampRequestChannel
+		currEntryToTimestamp, ok := <-timestampRequestChannel
+
+		// If our channel got closed by the parent, we're good to bail
+		if !ok {
+			break
+		}
 
 		currAbsPath := currEntryToTimestamp.Paths.AbsolutePath
 		//fmt.Printf("Worker %s got file %s\n", workerName, currAbsPath)
@@ -196,37 +215,45 @@ func timestampWorker(workerName string, timestampRequestChannel chan RawfileInfo
 				continue
 			}
 
-			for k, v := range fileInfo.Fields {
-				if k == "DateTimeOriginal" {
+			dateTimeOriginal, ok := fileInfo.Fields["DateTimeOriginal"]
 
-					//fmt.Printf("%s: [%v] %v\n", workerName, k, v)
+			if !ok {
+				panic("Could not find DateTimeOriginal field in file")
+			}
 
-					// Type assertion to get the value into a format we can handle
-					if s, ok := v.(string); !ok {
-						//fmt.Printf("Could not force %v into a string", v)
-						continue
-					} else {
-						// Create valid datestring
-						validDatetime := fmt.Sprintf("%04s-%02s-%02s %s",
-							s[0:4], s[5:7], s[8:10], s[11:])
+			// Type assertion to get the value into a format we can handle
+			s, ok := dateTimeOriginal.(string)
 
-						if myDatetime, err := time.Parse(datetimeFormatString, validDatetime); err != nil {
-							//fmt.Printf("error %s\n", err.Error())
-							continue
-						} else {
-							timestampComputedChannel <- timestampForRelativePath{
-								relativePath:      currEntryToTimestamp.Paths.RelativePath,
-								computedTimestamp: myDatetime,
-							}
-						}
-					}
-				}
+			if !ok {
+				//fmt.Printf("Could not force %v into a string", v)
+				continue
+			}
+
+			// Create valid datestring
+			validDatetime := fmt.Sprintf("%04s-%02s-%02s %s",
+				s[0:4], s[5:7], s[8:10], s[11:])
+
+			myDatetime, err := time.Parse(datetimeFormatString, validDatetime)
+			if err != nil {
+				//fmt.Printf("error %s\n", err.Error())
+				continue
+			}
+			timestampComputedChannel <- timestampForRelativePath{
+				relativePath:      currEntryToTimestamp.Paths.RelativePath,
+				computedTimestamp: myDatetime,
 			}
 		}
 	}
+
+	if err := et.Close(); err != nil {
+		panic(err)
+	}
+
+	//fmt.Printf("Worker %s exiting cleanly\n", workerName)
+	wg.Done()
 }
 
-func getExifTimestamps(fileManifests map[string][]RawfileInfo, programOpts ProgramOptions) {
+func getExifTimestamps(fileManifests SourceManifests, programOpts ProgramOptions) {
 	fmt.Println("\nRetrieving EXIF timestamps for all files")
 
 	reverseMap := createReverseMap(fileManifests)
@@ -236,11 +263,14 @@ func getExifTimestamps(fileManifests map[string][]RawfileInfo, programOpts Progr
 	// Create two channels, one to send work to timestamp workers, one for workers to send timestamps back
 	timestampRequestChannel := make(chan RawfileInfo, programOpts.QueueLength)
 	timestampComputedChannel := make(chan timestampForRelativePath, programOpts.QueueLength)
+	var wg sync.WaitGroup
 
 	numTimestampWorkers := runtime.NumCPU() - 1
 	for i := 0; i < numTimestampWorkers; i++ {
 		workerName := fmt.Sprintf("worker_%02d", i+1)
-		go timestampWorker(workerName, timestampRequestChannel, timestampComputedChannel)
+		wg.Add(1)
+		go timestampWorker(workerName, timestampRequestChannel, timestampComputedChannel, &wg)
+		//fmt.Printf("launched %s\n", workerName)
 	}
 
 	//fmt.Println("Done launching workers")
@@ -256,6 +286,14 @@ func getExifTimestamps(fileManifests map[string][]RawfileInfo, programOpts Progr
 			currSourceIndex++
 			//fmt.Printf("Sent entry %d of %d in timestamp sourcedir\n",
 			//	currSourceIndex, timestampsExpected)
+
+			// Should we close the channel to signal we're done?
+			if currSourceIndex == timestampsExpected {
+				close(timestampRequestChannel)
+
+				// Let our timestamp workers rejoin
+				wg.Wait()
+			}
 		}
 
 		// Select with default makes a non-blocking read
@@ -291,12 +329,14 @@ func getExifTimestamps(fileManifests map[string][]RawfileInfo, programOpts Progr
 		}
 	}
 
-	fmt.Printf("\tAll %d timestamps computed", timestampsExpected)
+	if _, err := p.Printf("\tAll %d timestamps computed\n", timestampsExpected); err != nil {
+		panic(err)
+	}
 }
 
-func generateFileManifests(programOpts ProgramOptions) map[string][]RawfileInfo {
+func generateFileManifests(programOpts ProgramOptions) SourceManifests {
 	fmt.Println("\nStarting to scan for all RAW files")
-	sourceManifests := make(map[string][]RawfileInfo)
+	sourceManifests := make(SourceManifests)
 
 	totalFilesFound := 0
 
@@ -306,12 +346,94 @@ func generateFileManifests(programOpts ProgramOptions) map[string][]RawfileInfo 
 		totalFilesFound += len(sourceManifests[sourceDir])
 	}
 
-	fmt.Printf("\tFound %d RAW files in all sourcedirs\n", totalFilesFound)
+	if _, err := p.Printf("\tFound %d \".%s\" files in all sourcedirs\n", totalFilesFound,
+		strings.ToUpper(programOpts.FilenameExtension)); err != nil {
+
+		panic(err)
+	}
 	return sourceManifests
+}
+
+func splitExt(filename string) (base string, extension string) {
+	filenameExtension := filepath.Ext(filename)
+	filenameBase := filename[:len(filename)-len(filenameExtension)]
+
+	return filenameBase, filenameExtension
+}
+
+func setDestinationFilenames(programOpts ProgramOptions, fileManifests SourceManifests) {
+	fmt.Println("\nDetermining unique filenames in destination storage directories")
+
+	// Resolve filename conflicts in the YYYY/YYYY-MM-DD destination dir
+	conflictsFound := 0
+
+	timestampsSourcedir := programOpts.SourceDirs[0]
+	rawfileEntries := fileManifests[timestampsSourcedir]
+	destDirPrefix := programOpts.DestinationLocations[0]
+
+	for rawfileEntryIndex, currRawfileEntry := range rawfileEntries {
+		currTimestamp := currRawfileEntry.Timestamp
+		yearString := fmt.Sprintf("%4d", currTimestamp.Year())
+		yearMonthDayString := fmt.Sprintf("%4d-%02d-%02d", currTimestamp.Year(),
+			currTimestamp.Month(), currTimestamp.Day())
+		//fmt.Printf("Got Year = %s, YMD = %s\n", yearString, yearMonthDayString)
+
+		relativeOutputDirectory := filepath.Join(yearString, yearMonthDayString)
+
+		rawfileEntries[rawfileEntryIndex].OutputRelativeDirectory = relativeOutputDirectory
+		//fmt.Printf("Relative directory for %s: %s\n",
+		//	currRawfileEntry.Paths.RelativePath, relativeOutputDirectory)
+
+		candidateDestination := filepath.Join(destDirPrefix, yearString, yearMonthDayString,
+			currRawfileEntry.BaseFilename)
+
+		_, err := os.Stat(candidateDestination)
+
+		// Break up filename into base and extension, tag on unique extension
+		filenameBase, filenameExt := splitExt(currRawfileEntry.BaseFilename)
+		uniqueExtension := 1
+		for !os.IsNotExist(err) {
+			conflictsFound++
+
+			// Try a unique extension to the base that may not conflict
+			candidateDestination := filepath.Join(destDirPrefix, yearString, yearMonthDayString,
+				fmt.Sprintf("%s_%04d.%s", filenameBase, uniqueExtension, filenameExt))
+
+			uniqueExtension++
+			_, err = os.Stat(candidateDestination)
+		}
+
+		rawfileEntries[rawfileEntryIndex].OutputRelativePath = candidateDestination
+	}
+
+	if _, err := p.Printf("\t%6d \".%s\" file(s) have had their unique destination paths determined\n",
+		len(rawfileEntries), strings.ToUpper(programOpts.FilenameExtension)); err != nil {
+
+		panic(err)
+	}
+	if _, err := p.Printf("\t%6d \".%s\" file(s) had their destination paths updated due to conflicts with existing files\n",
+		conflictsFound, strings.ToUpper(programOpts.FilenameExtension)); err != nil {
+
+		panic(err)
+	}
 }
 
 func main() {
 	programOpts := parseArgs()
 	fileManifests := generateFileManifests(programOpts)
+
+	// Make sure source file manifests match
+
 	getExifTimestamps(fileManifests, programOpts)
+
+	// Establish unique destination filenames
+	setDestinationFilenames(programOpts, fileManifests)
+
+	// Do copies/checksums
+
+	// Now that we've done all checksums, make sure they all MATCH
+
+	// Print IO stats
+
+	// Print performance stats
 }
