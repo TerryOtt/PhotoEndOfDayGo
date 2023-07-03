@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/akamensky/argparse"
 	"github.com/barasher/go-exiftool"
+	"golang.org/x/crypto/sha3"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 	"os"
@@ -43,6 +44,18 @@ type RawfileInfo struct {
 type timestampForRelativePath struct {
 	relativePath      string
 	computedTimestamp time.Time
+}
+
+type checksumRequest struct {
+	absolutePath    string
+	relativePath    string
+	bytesToChecksum []byte
+}
+
+type computedChecksum struct {
+	absolutePath     string
+	relativePath     string
+	computedChecksum []byte
 }
 
 type SourceManifests map[string][]RawfileInfo
@@ -418,18 +431,114 @@ func setDestinationFilenames(programOpts ProgramOptions, fileManifests SourceMan
 	}
 }
 
+func checksumWorker(checksumRequestChannel chan checksumRequest,
+	checksumsComputedChannel chan computedChecksum, checksumWorkerWaitGroup *sync.WaitGroup) {
+
+	for {
+		currEntryToChecksum, ok := <-checksumRequestChannel
+
+		// If our channel got closed by the parent, we're good to bail
+		if !ok {
+			break
+		}
+
+		shakeHash := make([]byte, 64)
+		sha3.ShakeSum256(shakeHash, currEntryToChecksum.bytesToChecksum)
+
+		fmt.Printf("Computed hash %x for file %s", string(shakeHash), currEntryToChecksum.absolutePath)
+		break
+	}
+
+	checksumWorkerWaitGroup.Done()
+}
+
+func launchChecksumWorkers(programOpts ProgramOptions,
+	checksumsComputedChannel chan computedChecksum) (chan checksumRequest, *sync.WaitGroup) {
+
+	// Create channel to send requests for checksums
+	checksumRequestChannel := make(chan checksumRequest)
+
+	checksumWorkerWaitGroup := sync.WaitGroup{}
+
+	for i := 0; i < programOpts.ChecksumThreads; i++ {
+		checksumWorkerWaitGroup.Add(1)
+		go checksumWorker(checksumRequestChannel, checksumsComputedChannel, &checksumWorkerWaitGroup)
+	}
+
+	return checksumRequestChannel, &checksumWorkerWaitGroup
+}
+
+func destinationWriterWorker(programOpts ProgramOptions, destinationLocation string,
+	wg *sync.WaitGroup, checksumRequestChannel chan checksumRequest) {
+
+	wg.Done()
+}
+
+func sourceReaderWorker(programOpts ProgramOptions, sourceDirectory string,
+	wg *sync.WaitGroup, checksumRequestChannel chan checksumRequest) {
+
+	// Read all files in our sourcedir
+
+	// request checksum on file contents
+
+	// send file contents to all dest writers, and
+
+	wg.Done()
+}
+
+func launchFileReadersWriters(programOpts ProgramOptions,
+	checksumRequestChannel chan checksumRequest) (*sync.WaitGroup, *sync.WaitGroup) {
+
+	destinationWritersWaitGroup := sync.WaitGroup{}
+	// Launch Writers
+	for _, destinationLocation := range programOpts.DestinationLocations {
+		destinationWritersWaitGroup.Add(1)
+		go destinationWriterWorker(programOpts, destinationLocation, &destinationWritersWaitGroup,
+			checksumRequestChannel)
+	}
+
+	// Launch Readers
+	sourceReadersWaitGroup := sync.WaitGroup{}
+	for _, sourceDirectory := range programOpts.SourceDirs {
+		sourceReadersWaitGroup.Add(1)
+		go sourceReaderWorker(programOpts, sourceDirectory, &sourceReadersWaitGroup, checksumRequestChannel)
+	}
+
+	return &sourceReadersWaitGroup, &destinationWritersWaitGroup
+}
+
 func main() {
 	programOpts := parseArgs()
 	fileManifests := generateFileManifests(programOpts)
 
-	// Make sure source file manifests match
+	// TODO: Make sure source file manifests match
 
 	getExifTimestamps(fileManifests, programOpts)
 
 	// Establish unique destination filenames
 	setDestinationFilenames(programOpts, fileManifests)
 
-	// Do copies/checksums
+	// Launch checksum workers
+	checksumsComputedChannel := make(chan computedChecksum)
+	checksumRequestChannel, checksumWorkerWaitGroup := launchChecksumWorkers(programOpts, checksumsComputedChannel)
+
+	// Launch readers/writers
+	sourceReaderWaitGroup, destWriterWaitGroup := launchFileReadersWriters(programOpts, checksumRequestChannel)
+
+	// Read checksums out
+
+	// Signal all readers and writers can come home
+	close(checksumRequestChannel)
+	close(checksumsComputedChannel)
+
+	// Land all the readers and writers
+	sourceReaderWaitGroup.Wait()
+	destWriterWaitGroup.Wait()
+
+	// We can now close the channel for requests to signal the checksum writers can come home
+
+	// Land all the checksum workers now that the readers and writers are done
+	checksumWorkerWaitGroup.Wait()
 
 	// Now that we've done all checksums, make sure they all MATCH
 
