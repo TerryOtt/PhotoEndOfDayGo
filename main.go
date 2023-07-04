@@ -410,14 +410,19 @@ func setDestinationFilenames(programOpts ProgramOptions, fileManifests SourceMan
 			conflictsFound++
 
 			// Try a unique extension to the base that may not conflict
-			candidateDestination := filepath.Join(destDirPrefix, yearString, yearMonthDayString,
-				fmt.Sprintf("%s_%04d.%s", filenameBase, uniqueExtension, filenameExt))
+			candidateDestination = filepath.Join(destDirPrefix, yearString, yearMonthDayString,
+				fmt.Sprintf("%s_%04d%s", filenameBase, uniqueExtension, filenameExt))
 
 			uniqueExtension++
+			//fmt.Printf("\tTesting updated version to see if there is no conflict: %s\n", candidateDestination)
 			_, err = os.Stat(candidateDestination)
 		}
+		//fmt.Printf("\tFinal non-conflicting destination: %s\n", candidateDestination)
 
-		rawfileEntries[rawfileEntryIndex].OutputRelativePath = candidateDestination
+		rawfileEntries[rawfileEntryIndex].OutputRelativePath = filepath.Join(relativeOutputDirectory,
+			filepath.Base(candidateDestination))
+
+		//fmt.Printf("\tOutput relative path %s\n", rawfileEntries[rawfileEntryIndex].OutputRelativePath)
 	}
 
 	if _, err := p.Printf("\t%6d \".%s\" file(s) have had their unique destination paths determined\n",
@@ -489,6 +494,17 @@ func destinationWriterWorker(programOpts ProgramOptions, destinationLocation str
 			break
 		}
 
+		//fmt.Printf("\tRelative path for this file: %s\n", currEntryToWrite.relativePath)
+
+		// See if we need to create any intermediate directories
+		targetDir := filepath.Dir(filepath.Join(destinationLocation, currEntryToWrite.relativePath))
+		if _, err := os.Stat(targetDir); os.IsNotExist(err) {
+			fmt.Printf("\tDirectory %s did not exist, creating it", targetDir)
+			if err := os.MkdirAll(targetDir, 0700); err != nil {
+				panic(err)
+			}
+		}
+
 		destAbsolutePath := filepath.Join(destinationLocation, currEntryToWrite.relativePath)
 
 		// Write the contents to disk, read them back, and then ask for checksum
@@ -530,8 +546,7 @@ func sourceReaderWorker(programOpts ProgramOptions, sourceDirectory string, file
 		}
 
 		fileInfo := fileContents{
-			absolutePath: currRawfile.Paths.AbsolutePath,
-			relativePath: currRawfile.Paths.RelativePath,
+			relativePath: currRawfile.OutputRelativePath,
 			fileBytes:    bytesRead,
 		}
 
@@ -544,7 +559,7 @@ func sourceReaderWorker(programOpts ProgramOptions, sourceDirectory string, file
 		}
 	}
 
-	fmt.Printf("\tDone with sourcedir reader for %s\n", sourceDirectory)
+	//fmt.Printf("\tDone with sourcedir reader for %s\n", sourceDirectory)
 	wg.Done()
 }
 
@@ -599,7 +614,7 @@ func main() {
 		fileManifests, checksumRequestChannel)
 
 	// Read checksums out
-	numChecksums := 437 * 2 // TODO: compute this
+	numChecksums := 1871 * 2 // TODO: compute this
 	receivedChecksums := make(map[string]map[string]int)
 	for i := 0; i < numChecksums; i++ {
 		checksumInfo := <-checksumsComputedChannel
