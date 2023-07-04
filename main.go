@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"github.com/akamensky/argparse"
 	"github.com/barasher/go-exiftool"
@@ -46,16 +47,16 @@ type timestampForRelativePath struct {
 	computedTimestamp time.Time
 }
 
-type checksumRequest struct {
-	absolutePath    string
-	relativePath    string
-	bytesToChecksum []byte
-}
-
 type computedChecksum struct {
 	absolutePath     string
 	relativePath     string
 	computedChecksum []byte
+}
+
+type fileContents struct {
+	absolutePath string
+	relativePath string
+	fileBytes    []byte
 }
 
 type SourceManifests map[string][]RawfileInfo
@@ -431,7 +432,7 @@ func setDestinationFilenames(programOpts ProgramOptions, fileManifests SourceMan
 	}
 }
 
-func checksumWorker(checksumRequestChannel chan checksumRequest,
+func checksumWorker(checksumRequestChannel chan fileContents,
 	checksumsComputedChannel chan computedChecksum, checksumWorkerWaitGroup *sync.WaitGroup) {
 
 	for {
@@ -443,20 +444,27 @@ func checksumWorker(checksumRequestChannel chan checksumRequest,
 		}
 
 		shakeHash := make([]byte, 64)
-		sha3.ShakeSum256(shakeHash, currEntryToChecksum.bytesToChecksum)
+		sha3.ShakeSum256(shakeHash, currEntryToChecksum.fileBytes)
 
-		fmt.Printf("Computed hash %x for file %s", string(shakeHash), currEntryToChecksum.absolutePath)
-		break
+		//fmt.Printf("\tComputed hash %x for file %s\n", string(shakeHash), currEntryToChecksum.absolutePath)
+
+		checksumInfo := computedChecksum{
+			absolutePath:     currEntryToChecksum.absolutePath,
+			relativePath:     currEntryToChecksum.relativePath,
+			computedChecksum: shakeHash,
+		}
+
+		checksumsComputedChannel <- checksumInfo
 	}
 
 	checksumWorkerWaitGroup.Done()
 }
 
 func launchChecksumWorkers(programOpts ProgramOptions,
-	checksumsComputedChannel chan computedChecksum) (chan checksumRequest, *sync.WaitGroup) {
+	checksumsComputedChannel chan computedChecksum) (chan fileContents, *sync.WaitGroup) {
 
 	// Create channel to send requests for checksums
-	checksumRequestChannel := make(chan checksumRequest)
+	checksumRequestChannel := make(chan fileContents)
 
 	checksumWorkerWaitGroup := sync.WaitGroup{}
 
@@ -469,42 +477,103 @@ func launchChecksumWorkers(programOpts ProgramOptions,
 }
 
 func destinationWriterWorker(programOpts ProgramOptions, destinationLocation string,
-	wg *sync.WaitGroup, checksumRequestChannel chan checksumRequest) {
+	writerIncomingWork chan fileContents, wg *sync.WaitGroup, checksumRequestChannel chan fileContents) {
+
+	fmt.Printf("\tStarting destination writer for %s\n", destinationLocation)
+
+	for {
+		currEntryToWrite, ok := <-writerIncomingWork
+
+		// If our channel got closed by the parent, we're good to bail
+		if !ok {
+			break
+		}
+
+		destAbsolutePath := filepath.Join(destinationLocation, currEntryToWrite.relativePath)
+
+		// Write the contents to disk, read them back, and then ask for checksum
+		if err := os.WriteFile(destAbsolutePath, currEntryToWrite.fileBytes, 0600); err != nil {
+			panic(err)
+		}
+
+		// Read them bytes back
+		readbackBytes, err := os.ReadFile(destAbsolutePath)
+		if err != nil {
+			panic(err)
+		}
+
+		// Checksum the bytes
+		checksumData := fileContents{
+			absolutePath: destAbsolutePath,
+			relativePath: currEntryToWrite.relativePath,
+			fileBytes:    readbackBytes,
+		}
+		checksumRequestChannel <- checksumData
+	}
 
 	wg.Done()
 }
 
-func sourceReaderWorker(programOpts ProgramOptions, sourceDirectory string,
-	wg *sync.WaitGroup, checksumRequestChannel chan checksumRequest) {
+func sourceReaderWorker(programOpts ProgramOptions, sourceDirectory string, fileManifests SourceManifests,
+	wg *sync.WaitGroup, checksumRequestChannel chan fileContents, writerChannels []chan fileContents) {
+
+	fmt.Printf("\tStarting source reader for dir %s\n", sourceDirectory)
 
 	// Read all files in our sourcedir
+	for _, currRawfile := range fileManifests[sourceDirectory] {
+		//fmt.Printf("Trying to read rawfile %s\n", currRawfile.Paths.AbsolutePath)
 
-	// request checksum on file contents
+		bytesRead, err := os.ReadFile(currRawfile.Paths.AbsolutePath)
 
-	// send file contents to all dest writers, and
+		if err != nil {
+			panic(err)
+		}
 
+		fileInfo := fileContents{
+			absolutePath: currRawfile.Paths.AbsolutePath,
+			relativePath: currRawfile.Paths.RelativePath,
+			fileBytes:    bytesRead,
+		}
+
+		// Request checksum of file contents
+		checksumRequestChannel <- fileInfo
+
+		// Send to all destination writers
+		for _, currFileWriterChannel := range writerChannels {
+			currFileWriterChannel <- fileInfo
+		}
+	}
+
+	fmt.Printf("\tDone with sourcedir reader for %s\n", sourceDirectory)
 	wg.Done()
 }
 
-func launchFileReadersWriters(programOpts ProgramOptions,
-	checksumRequestChannel chan checksumRequest) (*sync.WaitGroup, *sync.WaitGroup) {
+func launchFileReadersWriters(programOpts ProgramOptions, fileManifests SourceManifests,
+	checksumRequestChannel chan fileContents) (*sync.WaitGroup, []chan fileContents, *sync.WaitGroup) {
+
+	// Keep list of channels to send file contents to destination writers
+	writerChannels := make([]chan fileContents, len(programOpts.DestinationLocations))
 
 	destinationWritersWaitGroup := sync.WaitGroup{}
 	// Launch Writers
-	for _, destinationLocation := range programOpts.DestinationLocations {
+	for destIndex, destinationLocation := range programOpts.DestinationLocations {
 		destinationWritersWaitGroup.Add(1)
-		go destinationWriterWorker(programOpts, destinationLocation, &destinationWritersWaitGroup,
-			checksumRequestChannel)
+
+		// Make the channel for this destination writer
+		writerChannels[destIndex] = make(chan fileContents)
+		go destinationWriterWorker(programOpts, destinationLocation, writerChannels[destIndex],
+			&destinationWritersWaitGroup, checksumRequestChannel)
 	}
 
 	// Launch Readers
 	sourceReadersWaitGroup := sync.WaitGroup{}
 	for _, sourceDirectory := range programOpts.SourceDirs {
 		sourceReadersWaitGroup.Add(1)
-		go sourceReaderWorker(programOpts, sourceDirectory, &sourceReadersWaitGroup, checksumRequestChannel)
+		go sourceReaderWorker(programOpts, sourceDirectory, fileManifests, &sourceReadersWaitGroup,
+			checksumRequestChannel, writerChannels)
 	}
 
-	return &sourceReadersWaitGroup, &destinationWritersWaitGroup
+	return &sourceReadersWaitGroup, writerChannels, &destinationWritersWaitGroup
 }
 
 func main() {
@@ -518,16 +587,48 @@ func main() {
 	// Establish unique destination filenames
 	setDestinationFilenames(programOpts, fileManifests)
 
+	fmt.Printf("\nStarting copy/checksum operations\n")
+
 	// Launch checksum workers
 	checksumsComputedChannel := make(chan computedChecksum)
-	checksumRequestChannel, checksumWorkerWaitGroup := launchChecksumWorkers(programOpts, checksumsComputedChannel)
+	checksumRequestChannel, checksumWorkerWaitGroup := launchChecksumWorkers(programOpts,
+		checksumsComputedChannel)
 
 	// Launch readers/writers
-	sourceReaderWaitGroup, destWriterWaitGroup := launchFileReadersWriters(programOpts, checksumRequestChannel)
+	sourceReaderWaitGroup, writerChannels, destWriterWaitGroup := launchFileReadersWriters(programOpts,
+		fileManifests, checksumRequestChannel)
 
 	// Read checksums out
+	numChecksums := 437 * 2 // TODO: compute this
+	receivedChecksums := make(map[string]map[string]int)
+	for i := 0; i < numChecksums; i++ {
+		checksumInfo := <-checksumsComputedChannel
+
+		hexChecksum := hex.EncodeToString(checksumInfo.computedChecksum)
+
+		// Is the relative path in our map yet?
+		if subMap, ok := receivedChecksums[checksumInfo.relativePath]; !ok {
+			receivedChecksums[checksumInfo.relativePath] = make(map[string]int)
+
+			// Add new entry
+			receivedChecksums[checksumInfo.relativePath][hexChecksum] = 1
+		} else {
+			// If we've seen this checksum before, increment its count
+			if checksumCount, ok := subMap[hexChecksum]; !ok {
+				// First time we've seen this checksum
+				subMap[hexChecksum] = 1
+			} else {
+				subMap[hexChecksum] = checksumCount + 1
+			}
+		}
+	}
+
+	p.Printf("\tAll %d checksums received\n", numChecksums)
 
 	// Signal all readers and writers can come home
+	for _, currWriterChannel := range writerChannels {
+		close(currWriterChannel)
+	}
 	close(checksumRequestChannel)
 	close(checksumsComputedChannel)
 
