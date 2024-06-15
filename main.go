@@ -222,6 +222,10 @@ func parseExifDate(exifDateTime string) time.Time {
 
 }
 
+func iso8601Datetime(timeToFormat time.Time) string {
+	return timeToFormat.Format(time.DateTime + "Z")
+}
+
 func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelRequest, wg *sync.WaitGroup) {
 	et, err := exiftool.NewExiftool()
 	if err != nil {
@@ -248,7 +252,8 @@ func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelReques
 			if val, ok := currRawfileInfoEntry.Fields["DateTimeOriginal"]; ok {
 				//fmt.Printf("File %s has datetime %v\n", currDateTimeRequest.absolutePath, val)
 				fileDateTime := parseExifDate(val.(string))
-				fmt.Printf("\tGot parsed datetime %s\n", fileDateTime)
+				fmt.Printf("\tGot parsed datetime %s\n",
+					iso8601Datetime(fileDateTime))
 			} else {
 				fmt.Printf("Field 'DateTimeOriginal' is missing\n")
 			}
