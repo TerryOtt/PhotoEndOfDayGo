@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"github.com/akamensky/argparse"
+	"github.com/barasher/go-exiftool"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +16,6 @@ import (
 type ProgramOptions struct {
 	DebugMode            bool     `json:"debug_mode"`
 	UtcOffsetHours       int      `json:"utc_offset_hours"`
-	ChecksumThreads      int      `json:"checksum_processes"`
 	FilenameExtension    string   `json:"filename_extension"`
 	QueueLength          int      `json:"queue_length"`
 	SourceDirs           []string `json:"source_dirs"`
@@ -40,6 +41,16 @@ type EnumerationChannelInfo struct {
 	foundFiles []RawfileInfo
 }
 
+type FileDateTimeChannelRequest struct {
+	sourcedirIndex int
+	absolutePath   string
+}
+
+type FileDateTimeChannelEntry struct {
+	sourcedirIndex int
+	fileDateTime   time.Time
+}
+
 func parseArgs() ProgramOptions {
 	parser := argparse.NewParser("", "Photo end of day script")
 	debugMode := parser.Flag("", "debug", &argparse.Options{
@@ -58,19 +69,6 @@ func parseArgs() ProgramOptions {
 		Required: false,
 		Help:     "Hours offset from UTC",
 		Default:  0,
-	})
-
-	queueLength := parser.Int("", "queue_length", &argparse.Options{
-		Required: false,
-		Help:     "Length of channel to send checksums",
-		Default:  9500,
-	})
-
-	defaultChecksumThreads := 4
-	checksumThreads := parser.Int("", "checksum_processes", &argparse.Options{
-		Required: false,
-		Help:     "Number of checksum processes",
-		Default:  defaultChecksumThreads,
 	})
 
 	requiredSourcedir := parser.StringPositional(nil)
@@ -93,9 +91,7 @@ func parseArgs() ProgramOptions {
 	programOpts := ProgramOptions{
 		DebugMode:            *debugMode,
 		UtcOffsetHours:       *timestampUtcOffsetHours,
-		ChecksumThreads:      *checksumThreads,
 		FilenameExtension:    *filenameExtension,
-		QueueLength:          *queueLength,
 		SourceDirs:           sourceDirs,
 		DestinationLocations: destinationDirs,
 	}
@@ -200,6 +196,70 @@ func processSourceFile(sourcefileInfo RawfileInfo, programOpts ProgramOptions, w
 	wg.Done()
 }
 
+func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelRequest, wg *sync.WaitGroup) {
+	et, err := exiftool.NewExiftool()
+	if err != nil {
+		fmt.Printf("Error when initializing ExifTool: %v\n", err)
+		return
+	}
+	defer et.Close()
+
+	// Read from incoming channel until sender closes it
+	for currDateTimeRequest := range incomingSourcefiles {
+		//fmt.Printf("\tGot incoming file index %5d, path: %s, \n", currDateTimeRequest.sourcedirIndex,
+		//	currDateTimeRequest.absolutePath)
+
+		rawFileInfo := et.ExtractMetadata(currDateTimeRequest.absolutePath)
+
+		//fmt.Printf("File %s has %d sections of info\n", currDateTimeRequest.absolutePath, len(rawFileInfo))
+
+		for _, currRawfileInfoEntry := range rawFileInfo {
+			if currRawfileInfoEntry.Err != nil {
+				fmt.Printf("Error concerning %v: %v\n", currRawfileInfoEntry.File, currRawfileInfoEntry.Err)
+			}
+
+			// Make sure we have DateTimeOriginal, or shit is fuck
+			if val, ok := currRawfileInfoEntry.Fields["DateTimeOriginal"]; ok {
+				fmt.Printf("File %s has datetime %v\n", currDateTimeRequest.absolutePath, val)
+			} else {
+				fmt.Printf("Field 'DateTimeOriginal' is missing\n")
+			}
+		}
+
+		// Mark work done
+		wg.Done()
+	}
+}
+
+func getRawfileDateTime(sourcefileList []RawfileInfo) {
+	fmt.Println("\nGetting date/time of RAW files")
+
+	wg := &sync.WaitGroup{}
+	sourcefilesNeedingDatetime := make(chan FileDateTimeChannelRequest)
+
+	for _ = range runtime.NumCPU() - 1 {
+		// Launch goroutines to run Exiftool
+		go getRawfileDateTimeWorker(sourcefilesNeedingDatetime, wg)
+	}
+	for i, currFileFromList := range sourcefileList {
+		//fmt.Printf("\tFound file in list %s\n", currFileFromList.Paths.AbsolutePath)
+		// Send sourcefile to worker
+		sourcefilesNeedingDatetime <- FileDateTimeChannelRequest{
+			i,
+			currFileFromList.Paths.AbsolutePath}
+
+		wg.Add(1)
+	}
+
+	// Block until wg semaphore is down to zero
+	wg.Wait()
+	fmt.Println("Parent unblocked, because waitgroup back down to zero")
+
+	// Close the channel which will cause goroutines to cleanly close
+	close(sourcefilesNeedingDatetime)
+	fmt.Println("Parent has closed channel that children are reading from")
+}
+
 func main() {
 	programOpts := parseArgs()
 	//_ = parseArgs()
@@ -242,18 +302,35 @@ func main() {
 
 	fmt.Println("\tAll sourcedirs have identical metadata!")
 
-	// Kick off a goroutine to process each sourcefile, alternating between sourcedirs to keep equal load on both
-	numFilesPerSourcedir := len(foundFiles[programOpts.SourceDirs[0]])
+	// Create a slice that will contain full path to every sourcefile
+	totalNumFiles := len(foundFiles[programOpts.SourceDirs[0]]) * len(programOpts.SourceDirs)
 
-	wg := &sync.WaitGroup{}
+	// Set it with proper capacity
+	fullSourceFileList := make([]RawfileInfo, 0, totalNumFiles)
 
-	for i := 0; i < numFilesPerSourcedir; i++ {
+	// For each file within a sourcedir, sequentially add from each sourcedir,
+	//		which distributes file reading load evenly over source drives
+	for currFileIndex := range len(foundFiles[programOpts.SourceDirs[0]]) {
 		for _, currSourcedir := range programOpts.SourceDirs {
-			wg.Add(1)
-			go processSourceFile(foundFiles[currSourcedir][i], programOpts, wg)
+			fullSourceFileList = append(fullSourceFileList, foundFiles[currSourcedir][currFileIndex])
 		}
 	}
 
-	wg.Wait()
+	// Use Exiftool to pull date/time info from the RAW file
+	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]])
+
+	// Iterate through shuffled list of source files, fire off a goroutine to process each sourcefile
+	//numFilesPerSourcedir := len(foundFiles[programOpts.SourceDirs[0]])
+	//
+	//wg := &sync.WaitGroup{}
+	//
+	//for i := 0; i < numFilesPerSourcedir; i++ {
+	//	for _, currSourcedir := range programOpts.SourceDirs {
+	//		wg.Add(1)
+	//		go processSourceFile(foundFiles[currSourcedir][i], programOpts, wg)
+	//	}
+	//}
+	//
+	//wg.Wait()
 	fmt.Println("All copies have been written")
 }
