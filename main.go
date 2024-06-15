@@ -347,6 +347,8 @@ func main() {
 	// Use Exiftool to pull date/time info from the RAW file
 	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]])
 
+	// Let's do this
+
 	// TODO: determine unique destination filename for each sourcefile
 
 	// TODO: iterate through list of all absolute paths, firing off goroutine for each one that
