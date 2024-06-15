@@ -270,7 +270,7 @@ func getRawfileDateTime(sourcefileList []RawfileInfo) {
 	wg := &sync.WaitGroup{}
 	sourcefilesNeedingDatetime := make(chan FileDateTimeChannelRequest)
 
-	for _ = range runtime.NumCPU() - 1 {
+	for range runtime.NumCPU() - 1 {
 		// Launch goroutines to run Exiftool
 		go getRawfileDateTimeWorker(sourcefilesNeedingDatetime, wg)
 	}
