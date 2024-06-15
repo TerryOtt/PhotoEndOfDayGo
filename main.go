@@ -196,6 +196,32 @@ func processSourceFile(sourcefileInfo RawfileInfo, programOpts ProgramOptions, w
 	wg.Done()
 }
 
+func parseExifDate(exifDateTime string) time.Time {
+	var year int
+	var month int
+	var day int
+	var hour int
+	var minute int
+	var second int
+	const ns int = 0
+	timeLoc := time.UTC
+
+	//fmt.Printf("Got exif datetime %s, parsing with sScanf\n", exifDateTime)
+
+	_, err := fmt.Sscanf(exifDateTime, "%d:%d:%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second)
+
+	//fmt.Println("Back from scanf")
+
+	if err != nil {
+		panic(err)
+	}
+
+	returnTime := time.Date(year, time.Month(month), day, hour, minute, second, ns, timeLoc)
+
+	return returnTime
+
+}
+
 func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelRequest, wg *sync.WaitGroup) {
 	et, err := exiftool.NewExiftool()
 	if err != nil {
@@ -220,7 +246,9 @@ func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelReques
 
 			// Make sure we have DateTimeOriginal, or shit is fuck
 			if val, ok := currRawfileInfoEntry.Fields["DateTimeOriginal"]; ok {
-				fmt.Printf("File %s has datetime %v\n", currDateTimeRequest.absolutePath, val)
+				//fmt.Printf("File %s has datetime %v\n", currDateTimeRequest.absolutePath, val)
+				fileDateTime := parseExifDate(val.(string))
+				fmt.Printf("\tGot parsed datetime %s\n", fileDateTime)
 			} else {
 				fmt.Printf("Field 'DateTimeOriginal' is missing\n")
 			}
@@ -318,6 +346,20 @@ func main() {
 
 	// Use Exiftool to pull date/time info from the RAW file
 	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]])
+
+	// TODO: determine unique destination filename for each sourcefile
+
+	// TODO: iterate through list of all absolute paths, firing off goroutine for each one that
+	//		Reads input file contents
+	//		checksum input file bytes
+	//		iterate over destination directories
+	//			successful write = false
+	//			until succesful write == true
+	//				write bytes to destination file
+	//				close destination file
+	//				read destination file
+	//				if input bytes and bytes read back from disk are byte identical
+	//					successful write := true
 
 	// Iterate through shuffled list of source files, fire off a goroutine to process each sourcefile
 	//numFilesPerSourcedir := len(foundFiles[programOpts.SourceDirs[0]])
