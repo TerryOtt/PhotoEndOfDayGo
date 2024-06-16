@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"github.com/akamensky/argparse"
@@ -27,6 +28,7 @@ type ProgramOptions struct {
 type RawfileInfo struct {
 	Paths                   PathInfo
 	BaseFilename            string
+	FileExtension           string
 	FilesizeBytes           int
 	Timestamp               time.Time
 	OutputRelativeDirectory string
@@ -56,6 +58,7 @@ type FileDateTimeChannelEntry struct {
 type FileCopierRawfileInfo struct {
 	RelativePath    string
 	BaseFilename    string
+	FileExtension   string
 	Timestamp       time.Time
 	AbsolutePaths   []string
 	DestinationDirs []string
@@ -136,14 +139,17 @@ func iterateSourcedirFiles(sourceDir string, programOpts ProgramOptions,
 				return nil
 			}
 
+			currFilename := info.Name()
+			currFileExtension := filepath.Ext(currFilename)
+
 			newRawfile := RawfileInfo{
 				Paths: PathInfo{
 					path,
 					strings.TrimPrefix(path, sourceDir+"\\"),
 				},
 				FilesizeBytes: int(info.Size()),
-				BaseFilename:  info.Name(),
-			}
+				BaseFilename:  strings.TrimSuffix(currFilename, filepath.Ext(currFilename)),
+				FileExtension: currFileExtension}
 			foundFiles = append(foundFiles, newRawfile)
 			return nil
 		})
@@ -299,72 +305,160 @@ func getRawfileDateTime(sourcefileList []RawfileInfo) {
 	fmt.Printf("\tDates extracted successfully from all %d rawfiles\n", len(sourcefileList))
 }
 
-func imageFileCopyWorker(inputFileInfo FileCopierRawfileInfo, wg *sync.WaitGroup) {
-	fmt.Printf("\tWork starting on relative path %s\n",
-		inputFileInfo.RelativePath)
+func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.WaitGroup) {
 
-	// Map from computed checksum to number of input copies with that checksum
-	checksumsFound := make(map[string]int)
+	for inputFileInfo := range workerChannel {
 
-	fi, err := os.Stat(inputFileInfo.AbsolutePaths[0])
-	if err != nil {
-		panic("Could not get file info")
-	}
-	numberOfBytes := fi.Size()
+		//fmt.Printf("\tWork starting on relative path %s\n",
+		//	inputFileInfo.RelativePath)
 
-	canonicalFileBytes := make([]byte, numberOfBytes)
+		// Map from computed checksum to number of input copies with that checksum
+		checksumsFound := make(map[string]int)
 
-	for i, currInputAbsolutePath := range inputFileInfo.AbsolutePaths {
-		//fmt.Printf("\t\tChecksumming absolute path %s\n", currInputAbsolutePath)
-		fileBytes, err := os.ReadFile(currInputAbsolutePath)
+		fi, err := os.Stat(inputFileInfo.AbsolutePaths[0])
 		if err != nil {
-			panic("Could not read input file")
+			panic("Could not get file info")
 		}
-		computedChecksum := sha3.Sum512(fileBytes)
-		hexChecksum := hex.EncodeToString(computedChecksum[:])
-		//fmt.Printf("\t\t\tGot hex checksum %s\n", hexChecksum)
-		// Add to map of hashes we've seen
-		val, ok := checksumsFound[hexChecksum]
-		if !ok {
-			checksumsFound[hexChecksum] = 1
-		} else {
-			checksumsFound[hexChecksum] = val + 1
+		numberOfBytes := fi.Size()
+
+		canonicalFileBytes := make([]byte, numberOfBytes)
+
+		for i, currInputAbsolutePath := range inputFileInfo.AbsolutePaths {
+			//fmt.Printf("\t\tChecksumming absolute path %s\n", currInputAbsolutePath)
+			fileBytes, err := os.ReadFile(currInputAbsolutePath)
+			if err != nil {
+				panic("Could not read input file")
+			}
+			computedChecksum := sha3.Sum512(fileBytes)
+			hexChecksum := hex.EncodeToString(computedChecksum[:])
+			//fmt.Printf("\t\t\tGot hex checksum %s\n", hexChecksum)
+			// Add to map of hashes we've seen
+			val, ok := checksumsFound[hexChecksum]
+			if !ok {
+				checksumsFound[hexChecksum] = 1
+			} else {
+				checksumsFound[hexChecksum] = val + 1
+			}
+
+			// Store a copy of these file bytes away for copies should checksums match
+			if i == 0 {
+				copy(canonicalFileBytes, fileBytes)
+			}
 		}
 
-		// Store a copy of these file bytes away for copies should checksums match
+		// Make sure we only got one input checksum, or we're bailing
+		//fmt.Printf("\t\tChecksums seen: %v\n", checksumsFound)
+		if len(checksumsFound) != 1 {
+			panic("Inconsistent checksums for file " + inputFileInfo.RelativePath)
+		}
+		//fmt.Println("\t\tAll source copies are identical; proceeding with copy logic")
+
+		// Determine unique dest relative path
+		uniqueRelativePath := createUniqueRelativePath(inputFileInfo)
+		//fmt.Printf("\t\tUnique relative path found that works for all dest dirs: %s\n", uniqueRelativePath)
+
+		for _, destDir := range inputFileInfo.DestinationDirs {
+			successfulWrite := false
+			// Create absolute path, open file for binary writing
+			currDestfilePath := destDir + string(os.PathSeparator) + uniqueRelativePath
+
+			// Get absolute DIRECTORY path, and ensure all the directories are created that are needed
+			dirPath := filepath.Dir(currDestfilePath)
+			//fmt.Printf("\t\t\tDirectory path to file: %s\n", dirPath)
+			os.MkdirAll(dirPath, 0777)
+
+			for writeAttempts := 3; writeAttempts > 0; writeAttempts-- {
+				if err := os.WriteFile(currDestfilePath, canonicalFileBytes, 0600); err != nil {
+					continue
+				}
+				// read file back
+				readbackBytes, err := os.ReadFile(currDestfilePath)
+				if err != nil {
+					continue
+				}
+
+				// Compare our readback bytes to what we wrote
+				if bytes.Equal(canonicalFileBytes, readbackBytes) == true {
+					successfulWrite = true
+					break
+				}
+			}
+
+			if successfulWrite == false {
+				panic("Could not successfully write file")
+			}
+		}
+
+		//fmt.Printf("\t\tSuccessfully wrote %s to all destination directories!\n", uniqueRelativePath)
+
+		// Note that the work for this input file is complete and the function can terminate cleanly
+		wg.Done()
+
+		//fmt.Printf("\tWork complete on relative path %s\n",
+		//	inputFileInfo.RelativePath)
+	}
+}
+
+func createUniqueRelativePath(inputFileInfo FileCopierRawfileInfo) string {
+	// Iterate i 0 to 1000
+	// Create file name using base filename & i
+	// if i is zero, leave it off, otherwise append _nnnn to base
+	// conflict = false
+	// Iterate over dest dirs
+	// if conflict exists in current dest dir with attempted path
+	//		conflict = true
+	//		break
+	// if conflict == false
+	//		break
+	// end loop
+
+	// Will have fallen out with unique filename that works in all dest dirs
+
+	//fmt.Println("\t\tStarting to find unique destination relative path")
+	var testRelativePath string
+	var uniqueRelativePath string
+	foundUniqueRelativePath := false
+	for i := range 10000 {
 		if i == 0 {
-			copy(canonicalFileBytes, fileBytes)
+			testRelativePath = inputFileInfo.BaseFilename + inputFileInfo.FileExtension
+		} else {
+			testRelativePath = fmt.Sprintf("%s_%04d%s", inputFileInfo.BaseFilename,
+				i, inputFileInfo.FileExtension)
+		}
+
+		intermediateDateDirectories := fmt.Sprintf("%04d%s%s",
+			inputFileInfo.Timestamp.Year(), string(os.PathSeparator),
+			iso8601Datetime(inputFileInfo.Timestamp)[:10])
+
+		foundConflict := false
+		for _, currDestDir := range inputFileInfo.DestinationDirs {
+			conflictTest := currDestDir + string(os.PathSeparator) +
+				intermediateDateDirectories + string(os.PathSeparator) +
+				testRelativePath
+			//fmt.Printf("\t\t\tChecking if %s exists\n", conflictTest)
+
+			if _, err := os.Stat(conflictTest); err == nil {
+				foundConflict = true
+				break
+			}
+		}
+
+		// If we hit an existing file, increment index
+		if foundConflict == true {
+			continue
+		} else {
+			uniqueRelativePath = intermediateDateDirectories + string(os.PathSeparator) +
+				testRelativePath
+			foundUniqueRelativePath = true
+			break
 		}
 	}
 
-	// Make sure we only got one input checksum, or we're bailing
-	//fmt.Printf("\t\tChecksums seen: %v\n", checksumsFound)
-	if len(checksumsFound) != 1 {
-		panic("Inconsistent checksums for file " + inputFileInfo.RelativePath)
+	if !foundUniqueRelativePath {
+		panic("Could not find relative path")
 	}
-	fmt.Println("\t\tAll checksums matched, can proceed with copy logic")
 
-	// TODO: determine unique dest filename
-
-	// TODO: iterate over dest dirs
-	//		writeAttempts = 3
-	//		successfulWrite = false
-	//		while writeAttempts > 0 {
-	//			write bytes to dest file
-	//			close file
-	//			flush file
-	//			read file back
-	//			if byte identical to the input array, mark successful = true and break
-	//			else throw warn and try again
-	//		}
-	//		if successfulWrite is STILL false, panic because we can't do our work
-
-	// Note that the work for this input file is complete and the function can terminate cleanly
-	wg.Done()
-
-	fmt.Printf("\tWork complete on relative path %s\n",
-		inputFileInfo.RelativePath)
-
+	return uniqueRelativePath
 }
 
 func main() {
@@ -417,7 +511,21 @@ func main() {
 	wg := &sync.WaitGroup{}
 
 	fmt.Println("\nStarting file checksumming/copying operations")
-	// Fire off goroutines to process each relative file
+
+	fmt.Println("\tDestination directories:")
+	for _, destDir := range programOpts.DestinationLocations {
+		fmt.Printf("\t\t- %s\n", destDir)
+	}
+
+	workerChan := make(chan FileCopierRawfileInfo)
+
+	// Fire off worker pool
+	numWorkers := runtime.NumCPU()
+	for range numWorkers {
+		go imageFileCopyWorker(workerChan, wg)
+	}
+
+	// Fire off work to the worker pool
 	for currFileIndex := range len(foundFiles[programOpts.SourceDirs[0]]) {
 		currFileToPopulate := foundFiles[programOpts.SourceDirs[0]][currFileIndex]
 
@@ -429,14 +537,15 @@ func main() {
 		inputFileInfo := FileCopierRawfileInfo{
 			currFileToPopulate.Paths.RelativePath,
 			currFileToPopulate.BaseFilename,
+			currFileToPopulate.FileExtension,
 			currFileToPopulate.Timestamp,
 			inputFileAbsolutePaths,
 			programOpts.DestinationLocations}
 
-		go imageFileCopyWorker(inputFileInfo, wg)
+		workerChan <- inputFileInfo
 		wg.Add(1)
 
-		break
+		//break
 	}
 
 	wg.Wait()
