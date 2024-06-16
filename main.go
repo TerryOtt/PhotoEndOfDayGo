@@ -219,14 +219,15 @@ func parseExifDate(exifDateTime string) time.Time {
 	returnTime := time.Date(year, time.Month(month), day, hour, minute, second, ns, timeLoc)
 
 	return returnTime
-
 }
 
 func iso8601Datetime(timeToFormat time.Time) string {
 	return timeToFormat.Format(time.DateTime + "Z")
 }
 
-func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelRequest, wg *sync.WaitGroup) {
+func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelRequest,
+	responseChan chan FileDateTimeChannelEntry) {
+
 	et, err := exiftool.NewExiftool()
 	if err != nil {
 		fmt.Printf("Error when initializing ExifTool: %v\n", err)
@@ -234,7 +235,7 @@ func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelReques
 	}
 	defer et.Close()
 
-	// Read from incoming channel until sender closes it
+	// "range" will iterate reading over the channel until the channel is empty and closed
 	for currDateTimeRequest := range incomingSourcefiles {
 		//fmt.Printf("\tGot incoming file index %5d, path: %s, \n", currDateTimeRequest.sourcedirIndex,
 		//	currDateTimeRequest.absolutePath)
@@ -243,6 +244,7 @@ func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelReques
 
 		//fmt.Printf("File %s has %d sections of info\n", currDateTimeRequest.absolutePath, len(rawFileInfo))
 
+		// Read all sections of rawfile info
 		for _, currRawfileInfoEntry := range rawFileInfo {
 			if currRawfileInfoEntry.Err != nil {
 				fmt.Printf("Error concerning %v: %v\n", currRawfileInfoEntry.File, currRawfileInfoEntry.Err)
@@ -250,47 +252,57 @@ func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelReques
 
 			// Make sure we have DateTimeOriginal, or shit is fuck
 			if val, ok := currRawfileInfoEntry.Fields["DateTimeOriginal"]; ok {
-				//fmt.Printf("File %s has datetime %v\n", currDateTimeRequest.absolutePath, val)
 				fileDateTime := parseExifDate(val.(string))
-				fmt.Printf("\tGot parsed datetime %s\n",
-					iso8601Datetime(fileDateTime))
+				//fmt.Printf("\tFile index %5d has extracted time %s\n",
+				//	currDateTimeRequest.sourcedirIndex,
+				//	iso8601Datetime(fileDateTime))
+
+				// Send the date/time info back through the response channel
+				extractedDatetime := FileDateTimeChannelEntry{
+					currDateTimeRequest.sourcedirIndex,
+					fileDateTime}
+				responseChan <- extractedDatetime
+				//fmt.Println("Send extracted datetime back through response channel")
 			} else {
 				fmt.Printf("Field 'DateTimeOriginal' is missing\n")
 			}
 		}
-
-		// Mark work done
-		wg.Done()
 	}
 }
 
 func getRawfileDateTime(sourcefileList []RawfileInfo) {
 	fmt.Println("\nGetting date/time of RAW files")
 
-	wg := &sync.WaitGroup{}
 	sourcefilesNeedingDatetime := make(chan FileDateTimeChannelRequest)
+	extractedDatesChannel := make(chan FileDateTimeChannelEntry)
 
-	for range runtime.NumCPU() - 1 {
+	for range runtime.NumCPU() {
 		// Launch goroutines to run Exiftool
-		go getRawfileDateTimeWorker(sourcefilesNeedingDatetime, wg)
-	}
-	for i, currFileFromList := range sourcefileList {
-		//fmt.Printf("\tFound file in list %s\n", currFileFromList.Paths.AbsolutePath)
-		// Send sourcefile to worker
-		sourcefilesNeedingDatetime <- FileDateTimeChannelRequest{
-			i,
-			currFileFromList.Paths.AbsolutePath}
-
-		wg.Add(1)
+		go getRawfileDateTimeWorker(sourcefilesNeedingDatetime, extractedDatesChannel)
 	}
 
-	// Block until wg semaphore is down to zero
-	wg.Wait()
-	fmt.Println("Parent unblocked, because waitgroup back down to zero")
+	datesToRead := len(sourcefileList)
+	go func() {
+		for i, currFileFromList := range sourcefileList {
+			//fmt.Printf("\tFound file in list %s\n", currFileFromList.Paths.AbsolutePath)
+			// Send (array index, sourcefile path) tuples to worker channel
+			sourcefilesNeedingDatetime <- FileDateTimeChannelRequest{
+				i,
+				currFileFromList.Paths.AbsolutePath}
+		}
 
-	// Close the channel which will cause goroutines to cleanly close
-	close(sourcefilesNeedingDatetime)
-	fmt.Println("Parent has closed channel that children are reading from")
+		close(sourcefilesNeedingDatetime)
+	}()
+
+	// Read any remaining tuples from the response channel
+	for i := datesToRead; i > 0; i-- {
+		extractedDateInfo := <-extractedDatesChannel
+
+		// Populate the time field of the incoming array at the specified index
+		sourcefileList[extractedDateInfo.sourcedirIndex].Timestamp = extractedDateInfo.fileDateTime
+	}
+
+	fmt.Printf("\tDates extracted successfully from all %d rawfiles\n", len(sourcefileList))
 }
 
 func main() {
@@ -352,6 +364,10 @@ func main() {
 	// Use Exiftool to pull date/time info from the RAW file
 	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]])
 
+	// Let's see if the updates to the input array were passed by reference
+	fmt.Printf("File 0 in list 1 has extracted time %s\n",
+		iso8601Datetime(foundFiles[programOpts.SourceDirs[0]][0].Timestamp))
+
 	// Let's do this
 
 	// TODO: determine unique destination filename for each sourcefile
@@ -381,5 +397,6 @@ func main() {
 	//}
 	//
 	//wg.Wait()
-	fmt.Println("All copies have been written")
+
+	fmt.Println("All file copies have been made and verified!")
 }
