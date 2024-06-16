@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"github.com/akamensky/argparse"
 	"github.com/barasher/go-exiftool"
+	"golang.org/x/crypto/sha3"
 	"log"
 	"os"
 	"path/filepath"
@@ -49,6 +51,14 @@ type FileDateTimeChannelRequest struct {
 type FileDateTimeChannelEntry struct {
 	sourcedirIndex int
 	fileDateTime   time.Time
+}
+
+type FileCopierRawfileInfo struct {
+	RelativePath    string
+	BaseFilename    string
+	Timestamp       time.Time
+	AbsolutePaths   []string
+	DestinationDirs []string
 }
 
 func parseArgs() ProgramOptions {
@@ -180,22 +190,6 @@ func confirmIdenticalFilelists(foundFiles map[string][]RawfileInfo) bool {
 	return true
 }
 
-func processSourceFile(sourcefileInfo RawfileInfo, programOpts ProgramOptions, wg *sync.WaitGroup) {
-	// Get checksum for source file
-	sourceAbsolutePath := sourcefileInfo.Paths.AbsolutePath
-	//fmt.Printf("Goroutine starting up to process sourcefile %s", sourcefileInfo.Paths.AbsolutePath)
-
-	// Write to all destination directories
-	for _, currOutputDir := range programOpts.DestinationLocations {
-		fmt.Printf("\tWriting source %s to dest %s\n", sourceAbsolutePath, currOutputDir)
-	}
-
-	// make sure all write checksums match the source checksum
-
-	// We're done processing this file
-	wg.Done()
-}
-
 func parseExifDate(exifDateTime string) time.Time {
 	var year int
 	var month int
@@ -305,11 +299,79 @@ func getRawfileDateTime(sourcefileList []RawfileInfo) {
 	fmt.Printf("\tDates extracted successfully from all %d rawfiles\n", len(sourcefileList))
 }
 
+func imageFileCopyWorker(inputFileInfo FileCopierRawfileInfo, wg *sync.WaitGroup) {
+	fmt.Printf("\tWork starting on relative path %s\n",
+		inputFileInfo.RelativePath)
+
+	// Map from computed checksum to number of input copies with that checksum
+	checksumsFound := make(map[string]int)
+
+	fi, err := os.Stat(inputFileInfo.AbsolutePaths[0])
+	if err != nil {
+		panic("Could not get file info")
+	}
+	numberOfBytes := fi.Size()
+
+	canonicalFileBytes := make([]byte, numberOfBytes)
+
+	for i, currInputAbsolutePath := range inputFileInfo.AbsolutePaths {
+		//fmt.Printf("\t\tChecksumming absolute path %s\n", currInputAbsolutePath)
+		fileBytes, err := os.ReadFile(currInputAbsolutePath)
+		if err != nil {
+			panic("Could not read input file")
+		}
+		computedChecksum := sha3.Sum512(fileBytes)
+		hexChecksum := hex.EncodeToString(computedChecksum[:])
+		//fmt.Printf("\t\t\tGot hex checksum %s\n", hexChecksum)
+		// Add to map of hashes we've seen
+		val, ok := checksumsFound[hexChecksum]
+		if !ok {
+			checksumsFound[hexChecksum] = 1
+		} else {
+			checksumsFound[hexChecksum] = val + 1
+		}
+
+		// Store a copy of these file bytes away for copies should checksums match
+		if i == 0 {
+			copy(canonicalFileBytes, fileBytes)
+		}
+	}
+
+	// Make sure we only got one input checksum, or we're bailing
+	//fmt.Printf("\t\tChecksums seen: %v\n", checksumsFound)
+	if len(checksumsFound) != 1 {
+		panic("Inconsistent checksums for file " + inputFileInfo.RelativePath)
+	}
+	fmt.Println("\t\tAll checksums matched, can proceed with copy logic")
+
+	// TODO: determine unique dest filename
+
+	// TODO: iterate over dest dirs
+	//		writeAttempts = 3
+	//		successfulWrite = false
+	//		while writeAttempts > 0 {
+	//			write bytes to dest file
+	//			close file
+	//			flush file
+	//			read file back
+	//			if byte identical to the input array, mark successful = true and break
+	//			else throw warn and try again
+	//		}
+	//		if successfulWrite is STILL false, panic because we can't do our work
+
+	// Note that the work for this input file is complete and the function can terminate cleanly
+	wg.Done()
+
+	fmt.Printf("\tWork complete on relative path %s\n",
+		inputFileInfo.RelativePath)
+
+}
+
 func main() {
 	programOpts := parseArgs()
 	//_ = parseArgs()
 
-	// Create channel and waitgroup for the enumeration goroutines to write their file lists back to main
+	// Create channel for the enumeration goroutines to write their file lists back to main
 	filelistResultsChannel := make(chan EnumerationChannelInfo)
 
 	fmt.Println("Enumerating sourcedirs")
@@ -347,56 +409,37 @@ func main() {
 
 	fmt.Println("\tAll sourcedirs have identical metadata!")
 
-	// Create a slice that will contain full path to every sourcefile
-	totalNumFiles := len(foundFiles[programOpts.SourceDirs[0]]) * len(programOpts.SourceDirs)
-
-	// Set it with proper capacity
-	fullSourceFileList := make([]RawfileInfo, 0, totalNumFiles)
-
-	// For each file within a sourcedir, sequentially add from each sourcedir,
-	//		which distributes file reading load evenly over source drives
-	for currFileIndex := range len(foundFiles[programOpts.SourceDirs[0]]) {
-		for _, currSourcedir := range programOpts.SourceDirs {
-			fullSourceFileList = append(fullSourceFileList, foundFiles[currSourcedir][currFileIndex])
-		}
-	}
-
 	// Use Exiftool to pull date/time info from the RAW file
+	//		NOTE: we're using the fact that the array is passed by reference, because the target
+	//			function updates fields in each element of the array we pass down into this function
 	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]])
 
-	// Let's see if the updates to the input array were passed by reference
-	fmt.Printf("File 0 in list 1 has extracted time %s\n",
-		iso8601Datetime(foundFiles[programOpts.SourceDirs[0]][0].Timestamp))
+	wg := &sync.WaitGroup{}
 
-	// Let's do this
+	fmt.Println("\nStarting file checksumming/copying operations")
+	// Fire off goroutines to process each relative file
+	for currFileIndex := range len(foundFiles[programOpts.SourceDirs[0]]) {
+		currFileToPopulate := foundFiles[programOpts.SourceDirs[0]][currFileIndex]
 
-	// TODO: determine unique destination filename for each sourcefile
+		inputFileAbsolutePaths := make([]string, len(programOpts.SourceDirs))
+		for i, currSourceDir := range programOpts.SourceDirs {
+			inputFileAbsolutePaths[i] = foundFiles[currSourceDir][currFileIndex].Paths.AbsolutePath
+		}
 
-	// TODO: iterate through list of all absolute paths, firing off goroutine for each one that
-	//		Reads input file contents
-	//		checksum input file bytes
-	//		iterate over destination directories
-	//			successful write = false
-	//			until succesful write == true
-	//				write bytes to destination file
-	//				close destination file
-	//				read destination file
-	//				if input bytes and bytes read back from disk are byte identical
-	//					successful write := true
+		inputFileInfo := FileCopierRawfileInfo{
+			currFileToPopulate.Paths.RelativePath,
+			currFileToPopulate.BaseFilename,
+			currFileToPopulate.Timestamp,
+			inputFileAbsolutePaths,
+			programOpts.DestinationLocations}
 
-	// Iterate through shuffled list of source files, fire off a goroutine to process each sourcefile
-	//numFilesPerSourcedir := len(foundFiles[programOpts.SourceDirs[0]])
-	//
-	//wg := &sync.WaitGroup{}
-	//
-	//for i := 0; i < numFilesPerSourcedir; i++ {
-	//	for _, currSourcedir := range programOpts.SourceDirs {
-	//		wg.Add(1)
-	//		go processSourceFile(foundFiles[currSourcedir][i], programOpts, wg)
-	//	}
-	//}
-	//
-	//wg.Wait()
+		go imageFileCopyWorker(inputFileInfo, wg)
+		wg.Add(1)
 
-	fmt.Println("All file copies have been made and verified!")
+		break
+	}
+
+	wg.Wait()
+
+	fmt.Println("\nAll file copies have been made and verified!")
 }
