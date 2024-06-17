@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"github.com/akamensky/argparse"
 	"github.com/barasher/go-exiftool"
 	"golang.org/x/crypto/sha3"
-	"golang.org/x/text/language"
-	"golang.org/x/text/message"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,16 +16,23 @@ import (
 	"time"
 )
 
-var p = message.NewPrinter(language.English)
-
 type ProgramOptions struct {
 	DebugMode            bool     `json:"debug_mode"`
 	UtcOffsetHours       int      `json:"utc_offset_hours"`
-	ChecksumThreads      int      `json:"checksum_processes"`
 	FilenameExtension    string   `json:"filename_extension"`
 	QueueLength          int      `json:"queue_length"`
 	SourceDirs           []string `json:"source_dirs"`
 	DestinationLocations []string `json:"destination_dirs"`
+}
+
+type RawfileInfo struct {
+	Paths                   PathInfo
+	BaseFilename            string
+	FileExtension           string
+	FilesizeBytes           int
+	Timestamp               time.Time
+	OutputRelativeDirectory string
+	OutputRelativePath      string
 }
 
 type PathInfo struct {
@@ -33,33 +40,29 @@ type PathInfo struct {
 	RelativePath string
 }
 
-type RawfileInfo struct {
-	Paths                   PathInfo
-	BaseFilename            string
-	FilesizeBytes           int
-	Timestamp               time.Time
-	OutputRelativeDirectory string
-	OutputRelativePath      string
+type EnumerationChannelInfo struct {
+	sourcedir  string
+	foundFiles []RawfileInfo
 }
 
-type timestampForRelativePath struct {
-	relativePath      string
-	computedTimestamp time.Time
+type FileDateTimeChannelRequest struct {
+	sourcedirIndex int
+	absolutePath   string
 }
 
-type computedChecksum struct {
-	absolutePath     string
-	relativePath     string
-	computedChecksum []byte
+type FileDateTimeChannelEntry struct {
+	sourcedirIndex int
+	fileDateTime   time.Time
 }
 
-type fileContents struct {
-	absolutePath string
-	relativePath string
-	fileBytes    []byte
+type FileCopierRawfileInfo struct {
+	RelativePath    string
+	BaseFilename    string
+	FileExtension   string
+	Timestamp       time.Time
+	AbsolutePaths   []string
+	DestinationDirs []string
 }
-
-type SourceManifests map[string][]RawfileInfo
 
 func parseArgs() ProgramOptions {
 	parser := argparse.NewParser("", "Photo end of day script")
@@ -68,6 +71,7 @@ func parseArgs() ProgramOptions {
 		Help:     "Enable debug output",
 		Default:  false,
 	})
+
 	optionalSourcedirs := parser.StringList("", "additional_sourcedir", &argparse.Options{
 		Required: false,
 		Help:     "If there are more than one sourcedir to read from",
@@ -78,19 +82,6 @@ func parseArgs() ProgramOptions {
 		Required: false,
 		Help:     "Hours offset from UTC",
 		Default:  0,
-	})
-
-	queueLength := parser.Int("", "queue_length", &argparse.Options{
-		Required: false,
-		Help:     "Length of channel to send checksums",
-		Default:  9500,
-	})
-
-	defaultChecksumThreads := 4
-	checksumThreads := parser.Int("", "checksum_processes", &argparse.Options{
-		Required: false,
-		Help:     "Number of checksum processes",
-		Default:  defaultChecksumThreads,
 	})
 
 	requiredSourcedir := parser.StringPositional(nil)
@@ -113,9 +104,7 @@ func parseArgs() ProgramOptions {
 	programOpts := ProgramOptions{
 		DebugMode:            *debugMode,
 		UtcOffsetHours:       *timestampUtcOffsetHours,
-		ChecksumThreads:      *checksumThreads,
 		FilenameExtension:    *filenameExtension,
-		QueueLength:          *queueLength,
 		SourceDirs:           sourceDirs,
 		DestinationLocations: destinationDirs,
 	}
@@ -129,10 +118,10 @@ func parseArgs() ProgramOptions {
 	return programOpts
 }
 
-func scanSourceDirForImages(sourceDir string, programOpts ProgramOptions) []RawfileInfo {
-	var foundFiles []RawfileInfo
+func iterateSourcedirFiles(sourceDir string, programOpts ProgramOptions,
+	enumeratedFilesChannel chan EnumerationChannelInfo) {
 
-	//fmt.Printf("Scanning for sourcefiles in %s", sourceDir)
+	var foundFiles []RawfileInfo
 
 	err := filepath.Walk(sourceDir,
 		func(path string, info os.FileInfo, err error) error {
@@ -150,14 +139,17 @@ func scanSourceDirForImages(sourceDir string, programOpts ProgramOptions) []Rawf
 				return nil
 			}
 
+			currFilename := info.Name()
+			currFileExtension := filepath.Ext(currFilename)
+
 			newRawfile := RawfileInfo{
 				Paths: PathInfo{
 					path,
 					strings.TrimPrefix(path, sourceDir+"\\"),
 				},
 				FilesizeBytes: int(info.Size()),
-				BaseFilename:  info.Name(),
-			}
+				BaseFilename:  strings.TrimSuffix(currFilename, filepath.Ext(currFilename)),
+				FileExtension: currFileExtension}
 			foundFiles = append(foundFiles, newRawfile)
 			return nil
 		})
@@ -166,499 +158,397 @@ func scanSourceDirForImages(sourceDir string, programOpts ProgramOptions) []Rawf
 		panic(err)
 	}
 
-	//jsonBytes, _ := json.MarshalIndent(foundFiles, "", "    ")
-
-	//fmt.Printf("Files in %s: \n%s\n", sourceDir, string(jsonBytes))
-
-	return foundFiles
+	// send collected list of files and then bail, we've done our job
+	enumeratedFilesChannel <- EnumerationChannelInfo{
+		sourceDir,
+		foundFiles,
+	}
 }
 
-func createReverseMap(fileManifests SourceManifests) map[string][]*RawfileInfo {
-	relativeToAbsoluteMap := make(map[string][]*RawfileInfo)
+func confirmIdenticalFilelists(foundFiles map[string][]RawfileInfo) bool {
+	identicalCheck := make(map[string][]int)
 
-	// Create a map keyed by relative path, value is array of all the absolute paths that
-	//		share that relative path
-	for sourceDir, rawfilesInDir := range fileManifests {
-		//fmt.Println("Iterating over rawfiles in sourcedir ", sourceDir)
-		for index, currRawfile := range rawfilesInDir {
-			currRelativePath := currRawfile.Paths.RelativePath
-
-			currRawfileAddress := &(fileManifests[sourceDir][index])
-			if currValue, ok := relativeToAbsoluteMap[currRelativePath]; !ok {
-				// Initialize the array of rawfile pointers with the current rawfile pointer
-				relativeToAbsoluteMap[currRelativePath] = []*RawfileInfo{currRawfileAddress}
-			} else {
-				// Append this pointer to the list of pointers
-				relativeToAbsoluteMap[currRelativePath] = append(currValue, currRawfileAddress)
+	// Walk through every list and add an entry from its relative type to its filesize
+	for _, fileList := range foundFiles {
+		for _, currRawfileInfo := range fileList {
+			// Do we have an entry for this file yet?
+			currArray, ok := identicalCheck[currRawfileInfo.Paths.RelativePath]
+			if !ok {
+				identicalCheck[currRawfileInfo.Paths.RelativePath] = make([]int, 2)
 			}
+			currArray = append(currArray, currRawfileInfo.FilesizeBytes)
 		}
 	}
 
-	return relativeToAbsoluteMap
+	// To compare we're identical, all entries in the map should have two filesize values that are the same
+	for relativeFilePath, identicalCheckEntry := range identicalCheck {
+		if len(identicalCheckEntry) != 2 {
+			log.Printf("Relative key %s does not have two file entries\n", relativeFilePath)
+			return false
+		}
 
+		if identicalCheckEntry[0] != identicalCheckEntry[1] {
+			log.Printf("File bytes for %s do not match", relativeFilePath)
+			return false
+		}
+	}
+
+	return true
 }
 
-func timestampWorker(_ string, timestampRequestChannel chan RawfileInfo,
-	timestampComputedChannel chan timestampForRelativePath, wg *sync.WaitGroup) {
+func parseExifDate(exifDateTime string) time.Time {
+	var year int
+	var month int
+	var day int
+	var hour int
+	var minute int
+	var second int
+	const ns int = 0
+	timeLoc := time.UTC
 
-	//fmt.Printf("Worker %s starting\n", workerName)
+	//fmt.Printf("Got exif datetime %s, parsing with sScanf\n", exifDateTime)
 
-	et, err := exiftool.NewExiftool()
+	_, err := fmt.Sscanf(exifDateTime, "%d:%d:%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second)
+
+	//fmt.Println("Back from scanf")
+
 	if err != nil {
 		panic(err)
 	}
 
-	datetimeFormatString := "2006-01-02 15:04:05"
+	returnTime := time.Date(year, time.Month(month), day, hour, minute, second, ns, timeLoc)
 
-	for {
-		currEntryToTimestamp, ok := <-timestampRequestChannel
+	return returnTime
+}
 
-		// If our channel got closed by the parent, we're good to bail
-		if !ok {
-			break
+func iso8601Datetime(timeToFormat time.Time) string {
+	return timeToFormat.Format(time.DateTime + "Z")
+}
+
+func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelRequest,
+	responseChan chan FileDateTimeChannelEntry) {
+
+	et, err := exiftool.NewExiftool()
+	if err != nil {
+		fmt.Printf("Error when initializing ExifTool: %v\n", err)
+		return
+	}
+	defer et.Close()
+
+	// "range" will iterate reading over the channel until the channel is empty and closed
+	for currDateTimeRequest := range incomingSourcefiles {
+		//fmt.Printf("\tGot incoming file index %5d, path: %s, \n", currDateTimeRequest.sourcedirIndex,
+		//	currDateTimeRequest.absolutePath)
+
+		rawFileInfo := et.ExtractMetadata(currDateTimeRequest.absolutePath)
+
+		//fmt.Printf("File %s has %d sections of info\n", currDateTimeRequest.absolutePath, len(rawFileInfo))
+
+		// Read all sections of rawfile info
+		for _, currRawfileInfoEntry := range rawFileInfo {
+			if currRawfileInfoEntry.Err != nil {
+				fmt.Printf("Error concerning %v: %v\n", currRawfileInfoEntry.File, currRawfileInfoEntry.Err)
+			}
+
+			// Make sure we have DateTimeOriginal, or shit is fuck
+			if val, ok := currRawfileInfoEntry.Fields["DateTimeOriginal"]; ok {
+				fileDateTime := parseExifDate(val.(string))
+				//fmt.Printf("\tFile index %5d has extracted time %s\n",
+				//	currDateTimeRequest.sourcedirIndex,
+				//	iso8601Datetime(fileDateTime))
+
+				// Send the date/time info back through the response channel
+				extractedDatetime := FileDateTimeChannelEntry{
+					currDateTimeRequest.sourcedirIndex,
+					fileDateTime}
+				responseChan <- extractedDatetime
+				//fmt.Println("Send extracted datetime back through response channel")
+			} else {
+				fmt.Printf("Field 'DateTimeOriginal' is missing\n")
+			}
+		}
+	}
+}
+
+func getRawfileDateTime(sourcefileList []RawfileInfo) {
+	fmt.Println("\nGetting date/time of RAW files")
+
+	sourcefilesNeedingDatetime := make(chan FileDateTimeChannelRequest)
+	extractedDatesChannel := make(chan FileDateTimeChannelEntry)
+
+	for range runtime.NumCPU() {
+		// Launch goroutines to run Exiftool
+		go getRawfileDateTimeWorker(sourcefilesNeedingDatetime, extractedDatesChannel)
+	}
+
+	datesToRead := len(sourcefileList)
+	go func() {
+		for i, currFileFromList := range sourcefileList {
+			//fmt.Printf("\tFound file in list %s\n", currFileFromList.Paths.AbsolutePath)
+			// Send (array index, sourcefile path) tuples to worker channel
+			sourcefilesNeedingDatetime <- FileDateTimeChannelRequest{
+				i,
+				currFileFromList.Paths.AbsolutePath}
 		}
 
-		currAbsPath := currEntryToTimestamp.Paths.AbsolutePath
-		//fmt.Printf("Worker %s got file %s\n", workerName, currAbsPath)
+		close(sourcefilesNeedingDatetime)
+	}()
 
-		fileInfos := et.ExtractMetadata(currAbsPath)
+	// Read any remaining tuples from the response channel
+	for i := datesToRead; i > 0; i-- {
+		extractedDateInfo := <-extractedDatesChannel
 
-		for _, fileInfo := range fileInfos {
-			if fileInfo.Err != nil {
-				//fmt.Printf("Error in fileinfo")
-				continue
-			}
+		// Populate the time field of the incoming array at the specified index
+		sourcefileList[extractedDateInfo.sourcedirIndex].Timestamp = extractedDateInfo.fileDateTime
+	}
 
-			dateTimeOriginal, ok := fileInfo.Fields["DateTimeOriginal"]
+	fmt.Printf("\tDates extracted successfully from all %d rawfiles\n", len(sourcefileList))
+}
 
-			if !ok {
-				panic("Could not find DateTimeOriginal field in file")
-			}
+func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.WaitGroup) {
 
-			// Type assertion to get the value into a format we can handle
-			s, ok := dateTimeOriginal.(string)
+	for inputFileInfo := range workerChannel {
 
-			if !ok {
-				//fmt.Printf("Could not force %v into a string", v)
-				continue
-			}
+		//fmt.Printf("\tWork starting on relative path %s\n",
+		//	inputFileInfo.RelativePath)
 
-			// Create valid datestring
-			validDatetime := fmt.Sprintf("%04s-%02s-%02s %s",
-				s[0:4], s[5:7], s[8:10], s[11:])
+		// Map from computed checksum to number of input copies with that checksum
+		checksumsFound := make(map[string]int)
 
-			myDatetime, err := time.Parse(datetimeFormatString, validDatetime)
+		fi, err := os.Stat(inputFileInfo.AbsolutePaths[0])
+		if err != nil {
+			panic("Could not get file info")
+		}
+		numberOfBytes := fi.Size()
+
+		canonicalFileBytes := make([]byte, numberOfBytes)
+
+		for i, currInputAbsolutePath := range inputFileInfo.AbsolutePaths {
+			//fmt.Printf("\t\tChecksumming absolute path %s\n", currInputAbsolutePath)
+			fileBytes, err := os.ReadFile(currInputAbsolutePath)
 			if err != nil {
-				//fmt.Printf("error %s\n", err.Error())
-				continue
+				panic("Could not read input file")
 			}
-			timestampComputedChannel <- timestampForRelativePath{
-				relativePath:      currEntryToTimestamp.Paths.RelativePath,
-				computedTimestamp: myDatetime,
+			computedChecksum := sha3.Sum512(fileBytes)
+			hexChecksum := hex.EncodeToString(computedChecksum[:])
+			//fmt.Printf("\t\t\tGot hex checksum %s\n", hexChecksum)
+			// Add to map of hashes we've seen
+			val, ok := checksumsFound[hexChecksum]
+			if !ok {
+				checksumsFound[hexChecksum] = 1
+			} else {
+				checksumsFound[hexChecksum] = val + 1
 			}
-		}
-	}
 
-	if err := et.Close(); err != nil {
-		panic(err)
-	}
-
-	//fmt.Printf("Worker %s exiting cleanly\n", workerName)
-	wg.Done()
-}
-
-func getExifTimestamps(fileManifests SourceManifests, programOpts ProgramOptions) {
-	fmt.Println("\nRetrieving EXIF timestamps for all files")
-
-	reverseMap := createReverseMap(fileManifests)
-
-	//fmt.Println("\tDone creating reverse map")
-
-	// Create two channels, one to send work to timestamp workers, one for workers to send timestamps back
-	timestampRequestChannel := make(chan RawfileInfo, programOpts.QueueLength)
-	timestampComputedChannel := make(chan timestampForRelativePath, programOpts.QueueLength)
-	var wg sync.WaitGroup
-
-	numTimestampWorkers := runtime.NumCPU() - 1
-	for i := 0; i < numTimestampWorkers; i++ {
-		workerName := fmt.Sprintf("worker_%02d", i+1)
-		wg.Add(1)
-		go timestampWorker(workerName, timestampRequestChannel, timestampComputedChannel, &wg)
-		//fmt.Printf("launched %s\n", workerName)
-	}
-
-	//fmt.Println("Done launching workers")
-
-	timestampsReceived := 0
-	// First entry in the list of sourcedirs is the one we will use for timestamps
-	timestampSourcedir := fileManifests[programOpts.SourceDirs[0]]
-	timestampsExpected := len(timestampSourcedir)
-	currSourceIndex := 0
-	for timestampsReceived < timestampsExpected {
-		if currSourceIndex < timestampsExpected {
-			timestampRequestChannel <- timestampSourcedir[currSourceIndex]
-			currSourceIndex++
-			//fmt.Printf("Sent entry %d of %d in timestamp sourcedir\n",
-			//	currSourceIndex, timestampsExpected)
-
-			// Should we close the channel to signal we're done?
-			if currSourceIndex == timestampsExpected {
-				close(timestampRequestChannel)
-
-				// Let our timestamp workers rejoin
-				wg.Wait()
+			// Store a copy of these file bytes away for copies should checksums match
+			if i == 0 {
+				copy(canonicalFileBytes, fileBytes)
 			}
 		}
 
-		// Select with default makes a non-blocking read
-		timestampQueueExhausted := false
-		for !timestampQueueExhausted {
-			select {
-			case computedTimestamp := <-timestampComputedChannel:
-				timestampsReceived++
+		// Make sure we only got one input checksum, or we're bailing
+		//fmt.Printf("\t\tChecksums seen: %v\n", checksumsFound)
+		if len(checksumsFound) != 1 {
+			panic("Inconsistent checksums for file " + inputFileInfo.RelativePath)
+		}
+		//fmt.Println("\t\tAll source copies are identical; proceeding with copy logic")
 
-				//fmt.Printf("File %s got timestamp %s\n",
-				//	computedTimestamp.relativePath, computedTimestamp.computedTimestamp.Format(time.RFC3339))
+		// Determine unique dest relative path
+		uniqueRelativePath := createUniqueRelativePath(inputFileInfo)
+		//fmt.Printf("\t\tUnique relative path found that works for all dest dirs: %s\n", uniqueRelativePath)
 
-				manifestEntriesForThisRelativePath := reverseMap[computedTimestamp.relativePath]
-				for _, currManifestEntry := range manifestEntriesForThisRelativePath {
-					currManifestEntry.Timestamp = computedTimestamp.computedTimestamp
+		for _, destDir := range inputFileInfo.DestinationDirs {
+			successfulWrite := false
+			// Create absolute path, open file for binary writing
+			currDestfilePath := destDir + string(os.PathSeparator) + uniqueRelativePath
+
+			// Get absolute DIRECTORY path, and ensure all the directories are created that are needed
+			dirPath := filepath.Dir(currDestfilePath)
+			//fmt.Printf("\t\t\tDirectory path to file: %s\n", dirPath)
+			os.MkdirAll(dirPath, 0777)
+
+			for writeAttempts := 3; writeAttempts > 0; writeAttempts-- {
+				if err := os.WriteFile(currDestfilePath, canonicalFileBytes, 0600); err != nil {
+					continue
 				}
-				/*
-					// if this carried us over a percentage mark, display progress
-					oldPercentComplete := (float32(timestampsReceived-1) / float32(timestampsExpected)) * 100.0
-					newPercentComplete := (float32(timestampsReceived) / float32(timestampsExpected)) * 100.0
-					//fmt.Printf("New percent complete: %3.0f\n", newPercentComplete)
-					if int(oldPercentComplete) != int(newPercentComplete) {
-						fmt.Printf("Completed %d / %d (%3.0f%%) of timestamps\n",
-							timestampsReceived, timestampsExpected, newPercentComplete)
-					}
+				// read file back
+				readbackBytes, err := os.ReadFile(currDestfilePath)
+				if err != nil {
+					continue
+				}
 
-				*/
-			default:
-				// Nothing to read, break out of our loop
-				//fmt.Println("Nothing to read from checksum channel, breaking out of loop")
-				timestampQueueExhausted = true
+				// Compare our readback bytes to what we wrote
+				if bytes.Equal(canonicalFileBytes, readbackBytes) == true {
+					successfulWrite = true
+					break
+				}
 			}
-		}
-	}
 
-	if _, err := p.Printf("\tAll %d timestamps computed\n", timestampsExpected); err != nil {
-		panic(err)
-	}
-}
-
-func generateFileManifests(programOpts ProgramOptions) SourceManifests {
-	fmt.Println("\nStarting to scan for all RAW files")
-	sourceManifests := make(SourceManifests)
-
-	totalFilesFound := 0
-
-	for _, sourceDir := range programOpts.SourceDirs {
-		sourceManifests[sourceDir] = scanSourceDirForImages(sourceDir, programOpts)
-
-		totalFilesFound += len(sourceManifests[sourceDir])
-	}
-
-	if _, err := p.Printf("\tFound %d \".%s\" files in all sourcedirs\n", totalFilesFound,
-		strings.ToUpper(programOpts.FilenameExtension)); err != nil {
-
-		panic(err)
-	}
-	return sourceManifests
-}
-
-func splitExt(filename string) (base string, extension string) {
-	filenameExtension := filepath.Ext(filename)
-	filenameBase := filename[:len(filename)-len(filenameExtension)]
-
-	return filenameBase, filenameExtension
-}
-
-func setDestinationFilenames(programOpts ProgramOptions, fileManifests SourceManifests) {
-	fmt.Println("\nDetermining unique filenames in destination storage directories")
-
-	// Resolve filename conflicts in the YYYY/YYYY-MM-DD destination dir
-	conflictsFound := 0
-
-	timestampsSourcedir := programOpts.SourceDirs[0]
-	rawfileEntries := fileManifests[timestampsSourcedir]
-	destDirPrefix := programOpts.DestinationLocations[0]
-
-	for rawfileEntryIndex, currRawfileEntry := range rawfileEntries {
-		currTimestamp := currRawfileEntry.Timestamp
-		yearString := fmt.Sprintf("%4d", currTimestamp.Year())
-		yearMonthDayString := fmt.Sprintf("%4d-%02d-%02d", currTimestamp.Year(),
-			currTimestamp.Month(), currTimestamp.Day())
-		//fmt.Printf("Got Year = %s, YMD = %s\n", yearString, yearMonthDayString)
-
-		relativeOutputDirectory := filepath.Join(yearString, yearMonthDayString)
-
-		rawfileEntries[rawfileEntryIndex].OutputRelativeDirectory = relativeOutputDirectory
-		//fmt.Printf("Relative directory for %s: %s\n",
-		//	currRawfileEntry.Paths.RelativePath, relativeOutputDirectory)
-
-		candidateDestination := filepath.Join(destDirPrefix, yearString, yearMonthDayString,
-			currRawfileEntry.BaseFilename)
-
-		_, err := os.Stat(candidateDestination)
-
-		// Break up filename into base and extension, tag on unique extension
-		filenameBase, filenameExt := splitExt(currRawfileEntry.BaseFilename)
-		uniqueExtension := 1
-		for !os.IsNotExist(err) {
-			conflictsFound++
-
-			// Try a unique extension to the base that may not conflict
-			candidateDestination = filepath.Join(destDirPrefix, yearString, yearMonthDayString,
-				fmt.Sprintf("%s_%04d%s", filenameBase, uniqueExtension, filenameExt))
-
-			uniqueExtension++
-			//fmt.Printf("\tTesting updated version to see if there is no conflict: %s\n", candidateDestination)
-			_, err = os.Stat(candidateDestination)
-		}
-		//fmt.Printf("\tFinal non-conflicting destination: %s\n", candidateDestination)
-
-		rawfileEntries[rawfileEntryIndex].OutputRelativePath = filepath.Join(relativeOutputDirectory,
-			filepath.Base(candidateDestination))
-
-		//fmt.Printf("\tOutput relative path %s\n", rawfileEntries[rawfileEntryIndex].OutputRelativePath)
-	}
-
-	if _, err := p.Printf("\t%6d \".%s\" file(s) have had their unique destination paths determined\n",
-		len(rawfileEntries), strings.ToUpper(programOpts.FilenameExtension)); err != nil {
-
-		panic(err)
-	}
-	if _, err := p.Printf("\t%6d \".%s\" file(s) had their destination paths updated due to conflicts with existing files\n",
-		conflictsFound, strings.ToUpper(programOpts.FilenameExtension)); err != nil {
-
-		panic(err)
-	}
-}
-
-func checksumWorker(checksumRequestChannel chan fileContents,
-	checksumsComputedChannel chan computedChecksum, checksumWorkerWaitGroup *sync.WaitGroup) {
-
-	for {
-		currEntryToChecksum, ok := <-checksumRequestChannel
-
-		// If our channel got closed by the parent, we're good to bail
-		if !ok {
-			break
-		}
-
-		shakeHash := make([]byte, 64)
-		sha3.ShakeSum256(shakeHash, currEntryToChecksum.fileBytes)
-
-		//fmt.Printf("\tComputed hash %x for file %s\n", string(shakeHash), currEntryToChecksum.absolutePath)
-
-		checksumInfo := computedChecksum{
-			absolutePath:     currEntryToChecksum.absolutePath,
-			relativePath:     currEntryToChecksum.relativePath,
-			computedChecksum: shakeHash,
-		}
-
-		checksumsComputedChannel <- checksumInfo
-	}
-
-	checksumWorkerWaitGroup.Done()
-}
-
-func launchChecksumWorkers(programOpts ProgramOptions,
-	checksumsComputedChannel chan computedChecksum) (chan fileContents, *sync.WaitGroup) {
-
-	// Create channel to send requests for checksums
-	checksumRequestChannel := make(chan fileContents)
-
-	checksumWorkerWaitGroup := sync.WaitGroup{}
-
-	for i := 0; i < programOpts.ChecksumThreads; i++ {
-		checksumWorkerWaitGroup.Add(1)
-		go checksumWorker(checksumRequestChannel, checksumsComputedChannel, &checksumWorkerWaitGroup)
-	}
-
-	return checksumRequestChannel, &checksumWorkerWaitGroup
-}
-
-func destinationWriterWorker(programOpts ProgramOptions, destinationLocation string,
-	writerIncomingWork chan fileContents, wg *sync.WaitGroup, checksumRequestChannel chan fileContents) {
-
-	fmt.Printf("\tStarting destination writer for %s\n", destinationLocation)
-
-	for {
-		currEntryToWrite, ok := <-writerIncomingWork
-
-		// If our channel got closed by the parent, we're good to bail
-		if !ok {
-			break
-		}
-
-		//fmt.Printf("\tRelative path for this file: %s\n", currEntryToWrite.relativePath)
-
-		// See if we need to create any intermediate directories
-		targetDir := filepath.Dir(filepath.Join(destinationLocation, currEntryToWrite.relativePath))
-		if _, err := os.Stat(targetDir); os.IsNotExist(err) {
-			fmt.Printf("\tDirectory %s did not exist, creating it", targetDir)
-			if err := os.MkdirAll(targetDir, 0700); err != nil {
-				panic(err)
+			if successfulWrite == false {
+				panic("Could not successfully write file")
 			}
 		}
 
-		destAbsolutePath := filepath.Join(destinationLocation, currEntryToWrite.relativePath)
+		//fmt.Printf("\t\tSuccessfully wrote %s to all destination directories!\n", uniqueRelativePath)
 
-		// Write the contents to disk, read them back, and then ask for checksum
-		if err := os.WriteFile(destAbsolutePath, currEntryToWrite.fileBytes, 0600); err != nil {
-			panic(err)
-		}
+		// Note that the work for this input file is complete and the function can terminate cleanly
+		wg.Done()
 
-		// Read them bytes back
-		readbackBytes, err := os.ReadFile(destAbsolutePath)
-		if err != nil {
-			panic(err)
-		}
-
-		// Checksum the bytes
-		checksumData := fileContents{
-			absolutePath: destAbsolutePath,
-			relativePath: currEntryToWrite.relativePath,
-			fileBytes:    readbackBytes,
-		}
-		checksumRequestChannel <- checksumData
+		//fmt.Printf("\tWork complete on relative path %s\n",
+		//	inputFileInfo.RelativePath)
 	}
-
-	wg.Done()
 }
 
-func sourceReaderWorker(programOpts ProgramOptions, sourceDirectory string, fileManifests SourceManifests,
-	wg *sync.WaitGroup, checksumRequestChannel chan fileContents, writerChannels []chan fileContents) {
+func createUniqueRelativePath(inputFileInfo FileCopierRawfileInfo) string {
+	// Iterate i 0 to 1000
+	// Create file name using base filename & i
+	// if i is zero, leave it off, otherwise append _nnnn to base
+	// conflict = false
+	// Iterate over dest dirs
+	// if conflict exists in current dest dir with attempted path
+	//		conflict = true
+	//		break
+	// if conflict == false
+	//		break
+	// end loop
 
-	fmt.Printf("\tStarting source reader for dir %s\n", sourceDirectory)
+	// Will have fallen out with unique filename that works in all dest dirs
 
-	// Read all files in our sourcedir
-	for _, currRawfile := range fileManifests[sourceDirectory] {
-		//fmt.Printf("Trying to read rawfile %s\n", currRawfile.Paths.AbsolutePath)
-
-		bytesRead, err := os.ReadFile(currRawfile.Paths.AbsolutePath)
-
-		if err != nil {
-			panic(err)
+	//fmt.Println("\t\tStarting to find unique destination relative path")
+	var testRelativePath string
+	var uniqueRelativePath string
+	foundUniqueRelativePath := false
+	for i := range 10000 {
+		if i == 0 {
+			testRelativePath = inputFileInfo.BaseFilename + inputFileInfo.FileExtension
+		} else {
+			testRelativePath = fmt.Sprintf("%s_%04d%s", inputFileInfo.BaseFilename,
+				i, inputFileInfo.FileExtension)
 		}
 
-		fileInfo := fileContents{
-			relativePath: currRawfile.OutputRelativePath,
-			fileBytes:    bytesRead,
+		intermediateDateDirectories := fmt.Sprintf("%04d%s%s",
+			inputFileInfo.Timestamp.Year(), string(os.PathSeparator),
+			iso8601Datetime(inputFileInfo.Timestamp)[:10])
+
+		foundConflict := false
+		for _, currDestDir := range inputFileInfo.DestinationDirs {
+			conflictTest := currDestDir + string(os.PathSeparator) +
+				intermediateDateDirectories + string(os.PathSeparator) +
+				testRelativePath
+			//fmt.Printf("\t\t\tChecking if %s exists\n", conflictTest)
+
+			if _, err := os.Stat(conflictTest); err == nil {
+				foundConflict = true
+				break
+			}
 		}
 
-		// Request checksum of file contents
-		checksumRequestChannel <- fileInfo
-
-		// Send to all destination writers
-		for _, currFileWriterChannel := range writerChannels {
-			currFileWriterChannel <- fileInfo
+		// If we hit an existing file, increment index
+		if foundConflict == true {
+			continue
+		} else {
+			uniqueRelativePath = intermediateDateDirectories + string(os.PathSeparator) +
+				testRelativePath
+			foundUniqueRelativePath = true
+			break
 		}
 	}
 
-	//fmt.Printf("\tDone with sourcedir reader for %s\n", sourceDirectory)
-	wg.Done()
-}
-
-func launchFileReadersWriters(programOpts ProgramOptions, fileManifests SourceManifests,
-	checksumRequestChannel chan fileContents) (*sync.WaitGroup, []chan fileContents, *sync.WaitGroup) {
-
-	// Keep list of channels to send file contents to destination writers
-	writerChannels := make([]chan fileContents, len(programOpts.DestinationLocations))
-
-	destinationWritersWaitGroup := sync.WaitGroup{}
-	// Launch Writers
-	for destIndex, destinationLocation := range programOpts.DestinationLocations {
-		destinationWritersWaitGroup.Add(1)
-
-		// Make the channel for this destination writer
-		writerChannels[destIndex] = make(chan fileContents)
-		go destinationWriterWorker(programOpts, destinationLocation, writerChannels[destIndex],
-			&destinationWritersWaitGroup, checksumRequestChannel)
+	if !foundUniqueRelativePath {
+		panic("Could not find relative path")
 	}
 
-	// Launch Readers
-	sourceReadersWaitGroup := sync.WaitGroup{}
-	for _, sourceDirectory := range programOpts.SourceDirs {
-		sourceReadersWaitGroup.Add(1)
-		go sourceReaderWorker(programOpts, sourceDirectory, fileManifests, &sourceReadersWaitGroup,
-			checksumRequestChannel, writerChannels)
-	}
-
-	return &sourceReadersWaitGroup, writerChannels, &destinationWritersWaitGroup
+	return uniqueRelativePath
 }
 
 func main() {
 	programOpts := parseArgs()
-	fileManifests := generateFileManifests(programOpts)
+	//_ = parseArgs()
 
-	// TODO: Make sure source file manifests match
+	// Create channel for the enumeration goroutines to write their file lists back to main
+	filelistResultsChannel := make(chan EnumerationChannelInfo)
 
-	getExifTimestamps(fileManifests, programOpts)
+	fmt.Println("Enumerating sourcedirs")
 
-	// Establish unique destination filenames
-	setDestinationFilenames(programOpts, fileManifests)
+	// For each sourcedir, spin off a goroutine to enumerate the files under that directory
+	for _, currSourcedir := range programOpts.SourceDirs {
+		go iterateSourcedirFiles(currSourcedir, programOpts, filelistResultsChannel)
+	}
 
-	fmt.Printf("\nStarting copy/checksum operations\n")
+	foundFiles := make(map[string][]RawfileInfo)
 
-	// Launch checksum workers
-	checksumsComputedChannel := make(chan computedChecksum)
-	checksumRequestChannel, checksumWorkerWaitGroup := launchChecksumWorkers(programOpts,
-		checksumsComputedChannel)
+	// Read out of the channel until we hit as many "end of files" markers as we have sourcedirs
+	numdirs := len(programOpts.SourceDirs)
 
-	// Launch readers/writers
-	sourceReaderWaitGroup, writerChannels, destWriterWaitGroup := launchFileReadersWriters(programOpts,
-		fileManifests, checksumRequestChannel)
+	for i := 0; i < numdirs; i++ {
+		fileListFromChild := <-filelistResultsChannel
 
-	// Read checksums out
-	numChecksums := 1871 * 2 // TODO: compute this
-	receivedChecksums := make(map[string]map[string]int)
-	for i := 0; i < numChecksums; i++ {
-		checksumInfo := <-checksumsComputedChannel
+		foundFiles[fileListFromChild.sourcedir] = fileListFromChild.foundFiles
+	}
 
-		hexChecksum := hex.EncodeToString(checksumInfo.computedChecksum)
+	// Close the channel the children used, as they both signaled they are done writing
+	close(filelistResultsChannel)
 
-		// Is the relative path in our map yet?
-		if subMap, ok := receivedChecksums[checksumInfo.relativePath]; !ok {
-			receivedChecksums[checksumInfo.relativePath] = make(map[string]int)
+	for _, currSourcedir := range programOpts.SourceDirs {
+		currFileList := foundFiles[currSourcedir]
+		fmt.Printf("\tGot file list for \"%s\" with %d \".%s\" files\n", currSourcedir, len(currFileList),
+			programOpts.FilenameExtension)
+	}
 
-			// Add new entry
-			receivedChecksums[checksumInfo.relativePath][hexChecksum] = 1
-		} else {
-			// If we've seen this checksum before, increment its count
-			if checksumCount, ok := subMap[hexChecksum]; !ok {
-				// First time we've seen this checksum
-				subMap[hexChecksum] = 1
-			} else {
-				subMap[hexChecksum] = checksumCount + 1
-			}
+	fmt.Println("\nValidating identical metadata for all sourcedirs")
+	// Make sure all file lists are identical
+	if confirmIdenticalFilelists(foundFiles) == false {
+		panic("File lists are not identical")
+	}
+
+	fmt.Println("\tAll sourcedirs have identical metadata!")
+
+	// Use Exiftool to pull date/time info from the RAW file
+	//		NOTE: we're using the fact that the array is passed by reference, because the target
+	//			function updates fields in each element of the array we pass down into this function
+	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]])
+
+	wg := &sync.WaitGroup{}
+
+	fmt.Println("\nStarting file checksumming/copying operations")
+
+	fmt.Println("\tDestination directories:")
+	for _, destDir := range programOpts.DestinationLocations {
+		fmt.Printf("\t\t- %s\n", destDir)
+	}
+
+	workerChan := make(chan FileCopierRawfileInfo)
+
+	// Fire off worker pool
+	numWorkers := runtime.NumCPU()
+	for range numWorkers {
+		go imageFileCopyWorker(workerChan, wg)
+	}
+
+	// Fire off work to the worker pool
+	for currFileIndex := range len(foundFiles[programOpts.SourceDirs[0]]) {
+		currFileToPopulate := foundFiles[programOpts.SourceDirs[0]][currFileIndex]
+
+		inputFileAbsolutePaths := make([]string, len(programOpts.SourceDirs))
+		for i, currSourceDir := range programOpts.SourceDirs {
+			inputFileAbsolutePaths[i] = foundFiles[currSourceDir][currFileIndex].Paths.AbsolutePath
 		}
+
+		inputFileInfo := FileCopierRawfileInfo{
+			currFileToPopulate.Paths.RelativePath,
+			currFileToPopulate.BaseFilename,
+			currFileToPopulate.FileExtension,
+			currFileToPopulate.Timestamp,
+			inputFileAbsolutePaths,
+			programOpts.DestinationLocations}
+
+		workerChan <- inputFileInfo
+		wg.Add(1)
+
+		//break
 	}
 
-	p.Printf("\tAll %d checksums received\n", numChecksums)
+	wg.Wait()
 
-	// Signal all readers and writers can come home
-	for _, currWriterChannel := range writerChannels {
-		close(currWriterChannel)
-	}
-	close(checksumRequestChannel)
-	close(checksumsComputedChannel)
-
-	// Land all the readers and writers
-	sourceReaderWaitGroup.Wait()
-	destWriterWaitGroup.Wait()
-
-	// We can now close the channel for requests to signal the checksum writers can come home
-
-	// Land all the checksum workers now that the readers and writers are done
-	checksumWorkerWaitGroup.Wait()
-
-	// Now that we've done all checksums, make sure they all MATCH
-
-	// Print IO stats
-
-	// Print performance stats
+	fmt.Println("\nAll file copies have been made and verified!")
 }
