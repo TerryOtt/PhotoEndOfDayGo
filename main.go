@@ -109,25 +109,25 @@ func parseArgs() ProgramOptions {
 	optDest1 := parser.StringPositional(&argparse.Options{
 		Required: false,
 		Help:     "Optional output dir",
-		Default:  nil,
+		Default:  "",
 	})
 
 	optDest2 := parser.StringPositional(&argparse.Options{
 		Required: false,
 		Help:     "Optional output dir",
-		Default:  nil,
+		Default:  "",
 	})
 
 	optDest3 := parser.StringPositional(&argparse.Options{
 		Required: false,
 		Help:     "Optional output dir",
-		Default:  nil,
+		Default:  "",
 	})
 
 	optDest4 := parser.StringPositional(&argparse.Options{
 		Required: false,
 		Help:     "Optional output dir",
-		Default:  nil,
+		Default:  "",
 	})
 
 	// Parse the options
@@ -142,18 +142,18 @@ func parseArgs() ProgramOptions {
 	}
 
 	destinationDirs := []string{*destinationLocation}
-	if optDest1 != nil {
+	if *optDest1 != "" {
 		destinationDirs = append(destinationDirs, *optDest1)
 	}
-	if optDest2 != nil {
+	if *optDest2 != "" {
 		destinationDirs = append(destinationDirs, *optDest2)
 	}
 
-	if optDest3 != nil {
+	if *optDest3 != "" {
 		destinationDirs = append(destinationDirs, *optDest3)
 	}
 
-	if optDest4 != nil {
+	if *optDest4 != "" {
 		destinationDirs = append(destinationDirs, *optDest4)
 	}
 
