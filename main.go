@@ -64,6 +64,12 @@ type FileCopierRawfileInfo struct {
 	DestinationDirs []string
 }
 
+type FileContentsAndChecksumPair struct {
+	absolutePath string
+	fileContents []byte
+	fileChecksum string
+}
+
 func parseArgs() ProgramOptions {
 	parser := argparse.NewParser("", "Photo end of day script")
 	debugMode := parser.Flag("", "debug", &argparse.Options{
@@ -84,9 +90,45 @@ func parseArgs() ProgramOptions {
 		Default:  0,
 	})
 
-	requiredSourcedir := parser.StringPositional(nil)
-	filenameExtension := parser.SelectorPositional([]string{"nef", "cr3"}, nil)
-	destinationLocation := parser.StringPositional(nil)
+	requiredSourcedir := parser.StringPositional(&argparse.Options{
+		Required: true,
+		Help:     "Required input directory",
+		Default:  nil,
+	})
+	filenameExtension := parser.SelectorPositional([]string{"nef", "cr3"}, &argparse.Options{
+		Required: true,
+		Help:     "Rawfile image extension",
+		Default:  nil,
+	})
+	destinationLocation := parser.StringPositional(&argparse.Options{
+		Required: true,
+		Help:     "Required output directory",
+		Default:  nil,
+	})
+
+	optDest1 := parser.StringPositional(&argparse.Options{
+		Required: false,
+		Help:     "Optional output dir",
+		Default:  nil,
+	})
+
+	optDest2 := parser.StringPositional(&argparse.Options{
+		Required: false,
+		Help:     "Optional output dir",
+		Default:  nil,
+	})
+
+	optDest3 := parser.StringPositional(&argparse.Options{
+		Required: false,
+		Help:     "Optional output dir",
+		Default:  nil,
+	})
+
+	optDest4 := parser.StringPositional(&argparse.Options{
+		Required: false,
+		Help:     "Optional output dir",
+		Default:  nil,
+	})
 
 	// Parse the options
 	err := parser.Parse(os.Args)
@@ -100,6 +142,20 @@ func parseArgs() ProgramOptions {
 	}
 
 	destinationDirs := []string{*destinationLocation}
+	if optDest1 != nil {
+		destinationDirs = append(destinationDirs, *optDest1)
+	}
+	if optDest2 != nil {
+		destinationDirs = append(destinationDirs, *optDest2)
+	}
+
+	if optDest3 != nil {
+		destinationDirs = append(destinationDirs, *optDest3)
+	}
+
+	if optDest4 != nil {
+		destinationDirs = append(destinationDirs, *optDest4)
+	}
 
 	programOpts := ProgramOptions{
 		DebugMode:            *debugMode,
@@ -305,6 +361,52 @@ func getRawfileDateTime(sourcefileList []RawfileInfo) {
 	fmt.Printf("\tDates extracted successfully from all %d rawfiles\n", len(sourcefileList))
 }
 
+func readFileBytesAndChecksum(filePath string, responseChan chan FileContentsAndChecksumPair) {
+	fileBytes, err := os.ReadFile(filePath)
+	if err != nil {
+		panic("Could not read input file")
+	}
+	computedChecksum := sha3.Sum256(fileBytes)
+	hexChecksum := hex.EncodeToString(computedChecksum[:])
+	responseChan <- FileContentsAndChecksumPair{
+		filePath,
+		fileBytes,
+		hexChecksum,
+	}
+}
+func writeFileContents(canonicalFileBytes []byte, currDestfilePath string, wg *sync.WaitGroup) {
+	successfulWrite := false
+	// Create absolute path, open file for binary writing
+
+	// Get absolute DIRECTORY path, and ensure all the directories are created that are needed
+	dirPath := filepath.Dir(currDestfilePath)
+	//fmt.Printf("\t\t\tDirectory path to file: %s\n", dirPath)
+	os.MkdirAll(dirPath, 0777)
+
+	for writeAttempts := 3; writeAttempts > 0; writeAttempts-- {
+		if err := os.WriteFile(currDestfilePath, canonicalFileBytes, 0600); err != nil {
+			continue
+		}
+		// read file back
+		readbackBytes, err := os.ReadFile(currDestfilePath)
+		if err != nil {
+			continue
+		}
+
+		// Compare our readback bytes to what we wrote
+		if bytes.Equal(canonicalFileBytes, readbackBytes) == true {
+			successfulWrite = true
+			break
+		}
+	}
+
+	if successfulWrite == false {
+		panic("Could not successfully write file")
+	}
+
+	wg.Done()
+}
+
 func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.WaitGroup) {
 
 	for inputFileInfo := range workerChannel {
@@ -315,34 +417,22 @@ func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.Wait
 		// Map from computed checksum to number of input copies with that checksum
 		checksumsFound := make(map[string]int)
 
-		fi, err := os.Stat(inputFileInfo.AbsolutePaths[0])
-		if err != nil {
-			panic("Could not get file info")
+		// Fire off file read and checksum computes for all sourcedir versions
+		//		Note that the channel is buffered, so writers will not block
+		channelCapacity := max(len(inputFileInfo.AbsolutePaths), len(inputFileInfo.DestinationDirs))
+		contentsChecksumChan := make(chan FileContentsAndChecksumPair, channelCapacity)
+
+		for _, currSourcefile := range inputFileInfo.AbsolutePaths {
+			go readFileBytesAndChecksum(currSourcefile, contentsChecksumChan)
 		}
-		numberOfBytes := fi.Size()
 
-		canonicalFileBytes := make([]byte, numberOfBytes)
-
-		for i, currInputAbsolutePath := range inputFileInfo.AbsolutePaths {
-			//fmt.Printf("\t\tChecksumming absolute path %s\n", currInputAbsolutePath)
-			fileBytes, err := os.ReadFile(currInputAbsolutePath)
-			if err != nil {
-				panic("Could not read input file")
-			}
-			computedChecksum := sha3.Sum512(fileBytes)
-			hexChecksum := hex.EncodeToString(computedChecksum[:])
-			//fmt.Printf("\t\t\tGot hex checksum %s\n", hexChecksum)
-			// Add to map of hashes we've seen
-			val, ok := checksumsFound[hexChecksum]
-			if !ok {
-				checksumsFound[hexChecksum] = 1
+		var bytesAndChecksum FileContentsAndChecksumPair
+		for range len(inputFileInfo.AbsolutePaths) {
+			bytesAndChecksum = <-contentsChecksumChan
+			if val, ok := checksumsFound[bytesAndChecksum.fileChecksum]; !ok {
+				checksumsFound[bytesAndChecksum.fileChecksum] = 1
 			} else {
-				checksumsFound[hexChecksum] = val + 1
-			}
-
-			// Store a copy of these file bytes away for copies should checksums match
-			if i == 0 {
-				copy(canonicalFileBytes, fileBytes)
+				checksumsFound[bytesAndChecksum.fileChecksum] = val + 1
 			}
 		}
 
@@ -353,41 +443,21 @@ func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.Wait
 		}
 		//fmt.Println("\t\tAll source copies are identical; proceeding with copy logic")
 
+		canonicalFileBytes := bytesAndChecksum.fileContents
+
 		// Determine unique dest relative path
 		uniqueRelativePath := createUniqueRelativePath(inputFileInfo)
 		//fmt.Printf("\t\tUnique relative path found that works for all dest dirs: %s\n", uniqueRelativePath)
 
+		writersWg := &sync.WaitGroup{}
 		for _, destDir := range inputFileInfo.DestinationDirs {
-			successfulWrite := false
-			// Create absolute path, open file for binary writing
 			currDestfilePath := destDir + string(os.PathSeparator) + uniqueRelativePath
-
-			// Get absolute DIRECTORY path, and ensure all the directories are created that are needed
-			dirPath := filepath.Dir(currDestfilePath)
-			//fmt.Printf("\t\t\tDirectory path to file: %s\n", dirPath)
-			os.MkdirAll(dirPath, 0777)
-
-			for writeAttempts := 3; writeAttempts > 0; writeAttempts-- {
-				if err := os.WriteFile(currDestfilePath, canonicalFileBytes, 0600); err != nil {
-					continue
-				}
-				// read file back
-				readbackBytes, err := os.ReadFile(currDestfilePath)
-				if err != nil {
-					continue
-				}
-
-				// Compare our readback bytes to what we wrote
-				if bytes.Equal(canonicalFileBytes, readbackBytes) == true {
-					successfulWrite = true
-					break
-				}
-			}
-
-			if successfulWrite == false {
-				panic("Could not successfully write file")
-			}
+			writersWg.Add(1)
+			go writeFileContents(canonicalFileBytes, currDestfilePath, writersWg)
 		}
+
+		// Wait for all destination file writes to finish
+		writersWg.Wait()
 
 		//fmt.Printf("\t\tSuccessfully wrote %s to all destination directories!\n", uniqueRelativePath)
 
@@ -542,8 +612,8 @@ func main() {
 			inputFileAbsolutePaths,
 			programOpts.DestinationLocations}
 
-		workerChan <- inputFileInfo
 		wg.Add(1)
+		workerChan <- inputFileInfo
 
 		//break
 	}
