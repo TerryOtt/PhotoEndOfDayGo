@@ -221,7 +221,11 @@ func iterateSourcedirFiles(sourceDir string, programOpts ProgramOptions,
 	}
 }
 
-func confirmIdenticalFilelists(foundFiles map[string][]RawfileInfo) bool {
+func confirmIdenticalFilelists(foundFiles map[string][]RawfileInfo, timer *PerfTimer) bool {
+	defer timer.exitFunction(timer.enterFunction("Confirm source file lists are identical"))
+
+	fmt.Println("\nValidating identical metadata for all sourcedirs")
+
 	identicalCheck := make(map[string][]int)
 
 	// Walk through every list and add an entry from its relative type to its filesize
@@ -249,6 +253,7 @@ func confirmIdenticalFilelists(foundFiles map[string][]RawfileInfo) bool {
 		}
 	}
 
+	fmt.Println("\tAll sourcedirs have identical metadata!")
 	return true
 }
 
@@ -326,7 +331,11 @@ func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelReques
 	}
 }
 
-func getRawfileDateTime(sourcefileList []RawfileInfo) {
+func getRawfileDateTime(sourcefileList []RawfileInfo,
+	timer *PerfTimer) {
+
+	defer timer.exitFunction(timer.enterFunction("Extracting date info from RAW files"))
+
 	fmt.Println("\nGetting date/time of RAW files")
 
 	sourcefilesNeedingDatetime := make(chan FileDateTimeChannelRequest)
@@ -531,9 +540,8 @@ func createUniqueRelativePath(inputFileInfo FileCopierRawfileInfo) string {
 	return uniqueRelativePath
 }
 
-func main() {
-	programOpts := parseArgs()
-	//_ = parseArgs()
+func enumerateSourceDirs(programOpts ProgramOptions, timer *PerfTimer) map[string][]RawfileInfo {
+	defer timer.exitFunction(timer.enterFunction("Enumerate images in source directories"))
 
 	// Create channel for the enumeration goroutines to write their file lists back to main
 	filelistResultsChannel := make(chan EnumerationChannelInfo)
@@ -565,20 +573,11 @@ func main() {
 			programOpts.FilenameExtension)
 	}
 
-	fmt.Println("\nValidating identical metadata for all sourcedirs")
-	// Make sure all file lists are identical
-	if confirmIdenticalFilelists(foundFiles) == false {
-		panic("File lists are not identical")
-	}
+	return foundFiles
+}
 
-	fmt.Println("\tAll sourcedirs have identical metadata!")
-
-	// Use Exiftool to pull date/time info from the RAW file
-	//		NOTE: we're using the fact that the array is passed by reference, because the target
-	//			function updates fields in each element of the array we pass down into this function
-	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]])
-
-	wg := &sync.WaitGroup{}
+func doCopyOperations(programOpts ProgramOptions, foundFiles map[string][]RawfileInfo, timer *PerfTimer) {
+	defer timer.exitFunction(timer.enterFunction("Perform file copies, validate checksums of new files"))
 
 	fmt.Println("\nStarting file checksumming/copying operations")
 
@@ -591,6 +590,7 @@ func main() {
 
 	// Fire off worker pool
 	numWorkers := runtime.NumCPU()
+	wg := &sync.WaitGroup{}
 	for range numWorkers {
 		go imageFileCopyWorker(workerChan, wg)
 	}
@@ -621,4 +621,23 @@ func main() {
 	wg.Wait()
 
 	fmt.Println("\nAll file copies have been made and verified!")
+}
+
+func main() {
+	programOpts := parseArgs()
+
+	functionTimer := NewPerfTimer()
+
+	foundFiles := enumerateSourceDirs(programOpts, functionTimer)
+
+	// Make sure all file lists are identical
+	if confirmIdenticalFilelists(foundFiles, functionTimer) == false {
+		panic("File lists are not identical")
+	}
+
+	//		NOTE: we're using the fact that the array is passed by reference, because the target
+	//			function updates fields in each element of the array we pass down into this function
+	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]], functionTimer)
+
+	doCopyOperations(programOpts, foundFiles, functionTimer)
 }
