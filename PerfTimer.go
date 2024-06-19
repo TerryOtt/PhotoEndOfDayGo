@@ -22,6 +22,11 @@ type PerfTimer struct {
 	cumulativeTime  *time.Duration
 }
 
+type PerfTimingInfo struct {
+	operationTimes []CompletedTimer
+	cumulativeTime time.Duration
+}
+
 func NewPerfTimer() *PerfTimer {
 	return &PerfTimer{
 		make(map[uuid.UUID]timerInFlight),
@@ -66,6 +71,10 @@ func (pf *PerfTimer) exitFunction(timerId uuid.UUID) {
 	fmt.Printf("Cumulative time is now %s\n", pf.cumulativeTime.String())
 }
 
-func (pf *PerfTimer) CompletedTimers() []CompletedTimer {
-	return pf.completedTimers
+func (pf *PerfTimer) PerformanceStats() PerfTimingInfo {
+
+	return PerfTimingInfo{
+		pf.completedTimers,
+		*pf.cumulativeTime,
+	}
 }

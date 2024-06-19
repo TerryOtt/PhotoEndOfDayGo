@@ -331,6 +331,23 @@ func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelReques
 	}
 }
 
+func getSizeOfOneCopyInBytes(sourcefileList []RawfileInfo, timer *PerfTimer) int64 {
+	defer timer.exitFunction(timer.enterFunction("Computing total filesize of RAW images"))
+	fmt.Println("\nComputing total bytes in this set of RAW images")
+	cumulativeBytesInOneCopy := int64(0)
+
+	for _, currSource := range sourcefileList {
+		// Get size of this file in bytes
+		if fileInfo, err := os.Stat(currSource.Paths.AbsolutePath); err == nil {
+			cumulativeBytesInOneCopy += fileInfo.Size()
+		}
+	}
+
+	fmt.Printf("\tSize of RAW files: %.01f GB\n", float64(cumulativeBytesInOneCopy)/(1024*1024*1024))
+
+	return cumulativeBytesInOneCopy
+}
+
 func getRawfileDateTime(sourcefileList []RawfileInfo,
 	timer *PerfTimer) {
 
@@ -620,7 +637,43 @@ func doCopyOperations(programOpts ProgramOptions, foundFiles map[string][]Rawfil
 
 	wg.Wait()
 
-	fmt.Println("\nAll file copies have been made and verified!")
+	fmt.Println("\n\tAll file copies with verified contents created!")
+}
+
+func printProfilingStats(programOpts ProgramOptions, functionTimer *PerfTimer, bytesInImageSet int64) {
+	fmt.Println("\nPerformance Stats:")
+
+	timerInfo := functionTimer.PerformanceStats()
+
+	oneGB := float64(1024 * 1024 * 1024)
+
+	sourceCopies := len(programOpts.SourceDirs)
+	destCopies := len(programOpts.DestinationLocations)
+	fileSetGB := float64(bytesInImageSet) / oneGB
+	sourceGBRead := float64((int64(sourceCopies) * bytesInImageSet)) / oneGB
+	destGBWritten := float64((int64(destCopies) * bytesInImageSet)) / oneGB
+	destGBReadToVerify := destGBWritten
+	totalGB := sourceGBRead + destGBWritten + destGBReadToVerify
+	totalSeconds := timerInfo.cumulativeTime.Seconds()
+
+	fmt.Println("\n\t          I/O Operation           File Set (GB)    Copies Of File Set     GB      GB/s")
+	fmt.Println("\t-------------------------------   -------------    ------------------   -------   -----")
+	fmt.Printf("\t             Source images read         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, sourceCopies, sourceGBRead, sourceGBRead/totalSeconds)
+	fmt.Printf("\t            Dest copies created         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, destCopies, destGBWritten, destGBWritten/totalSeconds)
+	fmt.Printf("\tDest copies read back to verify         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, destCopies, destGBReadToVerify,
+		destGBReadToVerify/totalSeconds)
+	fmt.Printf("\n\t                          Total         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, sourceCopies+(destCopies*2), totalGB, totalGB/totalSeconds)
+
+	fmt.Println("\n\t                     Operation                         Time (s)   % of Total Time")
+	fmt.Println("\t----------------------------------------------------   --------   ---------------")
+	for _, currOpTime := range timerInfo.operationTimes {
+		currSec := currOpTime.duration.Seconds()
+		percentageTime := currSec / timerInfo.cumulativeTime.Seconds() * 100.0
+		fmt.Printf("\t%52s    %7.03f            %5.01f%%\n",
+			currOpTime.operationDescription,
+			currOpTime.duration.Seconds(),
+			percentageTime)
+	}
 }
 
 func main() {
@@ -635,9 +688,14 @@ func main() {
 		panic("File lists are not identical")
 	}
 
+	sizeOfOneCopyOfAllImages := getSizeOfOneCopyInBytes(foundFiles[programOpts.SourceDirs[0]],
+		functionTimer)
+
 	//		NOTE: we're using the fact that the array is passed by reference, because the target
 	//			function updates fields in each element of the array we pass down into this function
 	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]], functionTimer)
 
 	doCopyOperations(programOpts, foundFiles, functionTimer)
+
+	printProfilingStats(programOpts, functionTimer, sizeOfOneCopyOfAllImages)
 }
