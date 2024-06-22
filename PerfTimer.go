@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"time"
 )
 import "github.com/google/uuid"
@@ -60,15 +59,15 @@ func (pf *PerfTimer) exitFunction(timerId uuid.UUID) {
 	// Delete the timer from the list of in flight timers to avoid incorrect interface usage
 	delete(pf.timersInFlight, timerId)
 
-	fmt.Printf("Just completed timer for operation \"%s\" with time %s\n",
-		val.operationDescription, newCompletedTimer.duration)
+	//fmt.Printf("Just completed timer for operation \"%s\" with time %s\n",
+	//	val.operationDescription, newCompletedTimer.duration)
 	if pf.cumulativeTime == nil {
 		pf.cumulativeTime = &opDuration
 	} else {
 		*pf.cumulativeTime += opDuration
 	}
 
-	fmt.Printf("Cumulative time is now %s\n", pf.cumulativeTime.String())
+	//fmt.Printf("Cumulative time is now %s\n", pf.cumulativeTime.String())
 }
 
 func (pf *PerfTimer) PerformanceStats() PerfTimingInfo {

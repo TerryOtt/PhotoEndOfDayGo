@@ -656,24 +656,25 @@ func printProfilingStats(programOpts ProgramOptions, functionTimer *PerfTimer, b
 	totalGB := sourceGBRead + destGBWritten + destGBReadToVerify
 	totalSeconds := timerInfo.cumulativeTime.Seconds()
 
-	fmt.Println("\n\t          I/O Operation           File Set (GB)    Copies Of File Set     GB      GB/s")
-	fmt.Println("\t-------------------------------   -------------    ------------------   -------   -----")
-	fmt.Printf("\t             Source images read         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, sourceCopies, sourceGBRead, sourceGBRead/totalSeconds)
-	fmt.Printf("\t            Dest copies created         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, destCopies, destGBWritten, destGBWritten/totalSeconds)
-	fmt.Printf("\tDest copies read back to verify         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, destCopies, destGBReadToVerify,
-		destGBReadToVerify/totalSeconds)
-	fmt.Printf("\n\t                          Total         %7.01f                    %2d   %7.01f   %5.01f\n", fileSetGB, sourceCopies+(destCopies*2), totalGB, totalGB/totalSeconds)
+	fmt.Println("\n\t          I/O Operation           File Set (GB)    Copies Of File Set      GB")
+	fmt.Println("\t-------------------------------   -------------    ------------------   --------")
+	fmt.Printf("\t             Source images read         %7.01f                    %2d    %7.01f\n", fileSetGB, sourceCopies, sourceGBRead)
+	fmt.Printf("\t            Dest copies created         %7.01f                    %2d    %7.01f\n", fileSetGB, destCopies, destGBWritten)
+	fmt.Printf("\tDest copies read back to verify         %7.01f                    %2d    %7.01f\n", fileSetGB, destCopies, destGBReadToVerify)
+	fmt.Printf("\n\t                                          Total                    %2d    %7.01f   (%.01f GB/s average)\n",
+		sourceCopies+(destCopies*2), totalGB, totalGB/totalSeconds)
 
-	fmt.Println("\n\t                     Operation                         Time (s)   % of Total Time")
+	fmt.Println("\n\t                     Operation                         Time (s)    % of Total Time")
 	fmt.Println("\t----------------------------------------------------   --------   ---------------")
 	for _, currOpTime := range timerInfo.operationTimes {
 		currSec := currOpTime.duration.Seconds()
 		percentageTime := currSec / timerInfo.cumulativeTime.Seconds() * 100.0
-		fmt.Printf("\t%52s    %7.03f            %5.01f%%\n",
+		fmt.Printf("\t%52s   %8.01f            %5.01f%%\n",
 			currOpTime.operationDescription,
 			currOpTime.duration.Seconds(),
 			percentageTime)
 	}
+	fmt.Printf("\n\t                                               Total   %8.01f   (%.02f minutes)\n", totalSeconds, totalSeconds/60)
 }
 
 func main() {
