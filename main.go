@@ -65,6 +65,7 @@ type FileCopierRawfileInfo struct {
 	BaseFilename    string
 	FileExtension   string
 	Timestamp       time.Time
+	xmpFilename     string
 	AbsolutePaths   []string
 	DestinationDirs []string
 }
@@ -445,6 +446,31 @@ func writeFileContents(canonicalFileBytes []byte, currDestfilePath string, wg *s
 	wg.Done()
 }
 
+func doXmpCopy(sourceXmpAbsolutePath string, destImageFile string, wg *sync.WaitGroup) {
+	fileBytes, err := os.ReadFile(sourceXmpAbsolutePath)
+
+	if err != nil {
+		panic("Could not read XMP input file " + sourceXmpAbsolutePath)
+	}
+
+	// Get absolute DIRECTORY path, and ensure all the directories are created that are needed
+	dirPath := filepath.Dir(destImageFile)
+	//fmt.Printf("\t\t\tDirectory path to file: %s\n", dirPath)
+	os.MkdirAll(dirPath, 0777)
+
+	// Need part of the destination filename that is unique but without
+	withoutSuffix := strings.TrimSuffix(destImageFile, filepath.Ext(destImageFile))
+
+	// Figure out the dest XMP filename
+	destXmpfilename := withoutSuffix + ".xmp"
+
+	if err := os.WriteFile(destXmpfilename, fileBytes, 0600); err != nil {
+		panic("Could not create dest XMP file " + destXmpfilename)
+	}
+
+	wg.Done()
+}
+
 func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.WaitGroup) {
 
 	for inputFileInfo := range workerChannel {
@@ -492,6 +518,14 @@ func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.Wait
 			currDestfilePath := destDir + string(os.PathSeparator) + uniqueRelativePath
 			writersWg.Add(1)
 			go writeFileContents(canonicalFileBytes, currDestfilePath, writersWg)
+
+			// If we have created a geotagged XMP sidecar, copy that to the destdir too
+			if inputFileInfo.xmpFilename != "" {
+				writersWg.Add(1)
+				go doXmpCopy(inputFileInfo.xmpFilename, currDestfilePath, writersWg)
+			} else {
+				fmt.Println("No XMP file?!?!?")
+			}
 		}
 
 		// Wait for all destination file writes to finish
@@ -633,11 +667,14 @@ func doCopyOperations(programOpts ProgramOptions, foundFiles map[string][]Rawfil
 			inputFileAbsolutePaths[i] = foundFiles[currSourceDir][currFileIndex].Paths.AbsolutePath
 		}
 
+		//fmt.Printf("\t\tInside doCopy, XMP filename: %s\n", currFileToPopulate.absoluteXmpFileWithGeotag)
+
 		inputFileInfo := FileCopierRawfileInfo{
 			currFileToPopulate.Paths.RelativePath,
 			currFileToPopulate.BaseFilename,
 			currFileToPopulate.FileExtension,
 			currFileToPopulate.Timestamp,
+			currFileToPopulate.absoluteXmpFileWithGeotag,
 			inputFileAbsolutePaths,
 			programOpts.DestinationLocations}
 
@@ -791,7 +828,8 @@ func geotagXmpWriterWorker(geotagWriteChannel chan RawfileInfo, wg *sync.WaitGro
 }
 
 func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpxFile *os.File) {
-	defer functionTimer.exitFunction(functionTimer.enterFunction("Geotag source images using GPX file"))
+	defer functionTimer.exitFunction(
+		functionTimer.enterFunction("Create geotagged XMP sidecar files using GPX file"))
 	fmt.Println("\nCreating geotagged XMP sidecar files using provided GPX file")
 
 	fileInfo, err := gpxFile.Stat()
@@ -830,7 +868,10 @@ func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpx
 
 	// Iterate through all the files and geotag them -- could be parallelized, but no need,
 	//		it's crazy fast even in a single thread
-	for _, sourceFile := range sourceFiles {
+
+	// oh cute. Range actually creates a COPY of every element from its array. Meaning any modifications
+	//		to values inside it aren't gonna be reflected outside the loop
+	for i, sourceFile := range sourceFiles {
 		trackEntries := parsedGpxfile.PositionAt(sourceFile.Timestamp)
 		if len(trackEntries) > 1 {
 			fmt.Printf("WARN: somehow got multiple geotag position results for image %s, bailing on geotag",
@@ -854,13 +895,16 @@ func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpx
 		//		the semaphore to go negative
 		wg.Add(1)
 
-		// Record geotag into the source file info
+		// Record geotag -- note we have to use the array version as otherwise it's not gonna update outside
+		//		the loop
+		sourceFiles[i].GeotaggedLocation = gpsPoint
 		sourceFile.GeotaggedLocation = gpsPoint
 
 		// Write the XMP file that will contain the geotag
 		inputDir := filepath.Dir(sourceFile.Paths.AbsolutePath)
 		xmpFilename := inputDir + string(os.PathSeparator) + sourceFile.BaseFilename +
 			".xmp"
+		sourceFiles[i].absoluteXmpFileWithGeotag = xmpFilename
 		sourceFile.absoluteXmpFileWithGeotag = xmpFilename
 
 		// Write sourcefile that we geotagged
