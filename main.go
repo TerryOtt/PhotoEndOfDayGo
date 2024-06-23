@@ -699,8 +699,8 @@ func printProfilingStats(programOpts ProgramOptions, functionTimer *PerfTimer, b
 	sourceCopies := len(programOpts.SourceDirs)
 	destCopies := len(programOpts.DestinationLocations)
 	fileSetGB := float64(bytesInImageSet) / oneGB
-	sourceGBRead := float64((int64(sourceCopies) * bytesInImageSet)) / oneGB
-	destGBWritten := float64((int64(destCopies) * bytesInImageSet)) / oneGB
+	sourceGBRead := float64(int64(sourceCopies)*bytesInImageSet) / oneGB
+	destGBWritten := float64(int64(destCopies)*bytesInImageSet) / oneGB
 	destGBReadToVerify := destGBWritten
 	totalGB := sourceGBRead + destGBWritten + destGBReadToVerify
 	totalSeconds := timerInfo.cumulativeTime.Seconds()
@@ -924,7 +924,7 @@ func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpx
 		gpsPoint := gpxPointFromTimestamp(sourceFile.Timestamp, parsedGpxfile)
 
 		if gpsPoint == nil {
-			fmt.Printf("\t\tCould not geotag image %s, skipping\n",
+			fmt.Printf("\t\tINFO: unable to geotag image %s with GPX file provided\n",
 				sourceFile.Paths.RelativePath)
 			continue
 		}
