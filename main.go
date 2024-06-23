@@ -830,16 +830,12 @@ func geotagXmpWriterWorker(geotagWriteChannel chan RawfileInfo, wg *sync.WaitGro
 func gpxPointFromTimestamp(timestamp time.Time, parsedGpxFile *gpx.GPX) *gpx.Point {
 	gpxTimeBounds := parsedGpxFile.TimeBounds()
 
-	fmt.Printf("\tSuccessfully parsed GPX file\n\t\tStart time: %s\n\t\t  End time: %s\n",
-		iso8601Datetime(gpxTimeBounds.StartTime),
-		iso8601Datetime(gpxTimeBounds.EndTime))
-
 	// Make sure the file datetime is in the start/end time range of our GPX file
 	if timestamp.Before(gpxTimeBounds.StartTime) || timestamp.After(gpxTimeBounds.EndTime) {
 		return nil
 	}
 
-	// Identify exactly which track and segment inside the GPX our image timetamp falls within
+	// Identify exactly which track and segment inside the GPX our image timestamp falls within
 	correctTrack := -1
 	for i, currTrack := range parsedGpxFile.Tracks {
 		if timestamp.Before(currTrack.TimeBounds().StartTime) ||
@@ -898,6 +894,10 @@ func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpx
 	if err != nil {
 		panic("Parsing GPX file contents failed")
 	}
+
+	fmt.Printf("\tSuccessfully parsed GPX file\n\t\tStart time: %s\n\t\t  End time: %s\n",
+		iso8601Datetime(parsedGpxfile.TimeBounds().StartTime),
+		iso8601Datetime(parsedGpxfile.TimeBounds().EndTime))
 
 	//fmt.Println(parsedGpxfile.GetGpxInfo())
 
