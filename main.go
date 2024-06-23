@@ -827,6 +827,54 @@ func geotagXmpWriterWorker(geotagWriteChannel chan RawfileInfo, wg *sync.WaitGro
 	}
 }
 
+func gpxPointFromTimestamp(timestamp time.Time, parsedGpxFile *gpx.GPX) *gpx.Point {
+	gpxTimeBounds := parsedGpxFile.TimeBounds()
+
+	fmt.Printf("\tSuccessfully parsed GPX file\n\t\tStart time: %s\n\t\t  End time: %s\n",
+		iso8601Datetime(gpxTimeBounds.StartTime),
+		iso8601Datetime(gpxTimeBounds.EndTime))
+
+	// Make sure the file datetime is in the start/end time range of our GPX file
+	if timestamp.Before(gpxTimeBounds.StartTime) || timestamp.After(gpxTimeBounds.EndTime) {
+		return nil
+	}
+
+	// Identify exactly which track and segment inside the GPX our image timetamp falls within
+	correctTrack := -1
+	for i, currTrack := range parsedGpxFile.Tracks {
+		if timestamp.Before(currTrack.TimeBounds().StartTime) ||
+			timestamp.After(currTrack.TimeBounds().EndTime) {
+
+			continue
+		}
+		correctTrack = i
+		break
+	}
+	if correctTrack == -1 {
+		return nil
+	}
+
+	// Find correct track segment within our track
+	correctTrackSegment := -1
+	for i, currTrackSegment := range parsedGpxFile.Tracks[correctTrack].Segments {
+		if timestamp.Before(currTrackSegment.TimeBounds().StartTime) ||
+			timestamp.After(currTrackSegment.TimeBounds().EndTime) {
+
+			continue
+		}
+
+		correctTrackSegment = i
+		break
+	}
+	if correctTrackSegment == -1 {
+		return nil
+	}
+
+	trackSeg := parsedGpxFile.Tracks[correctTrack].Segments[correctTrackSegment]
+
+	return &trackSeg.Points[trackSeg.PositionAt(timestamp)].Point
+}
+
 func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpxFile *os.File) {
 	defer functionTimer.exitFunction(
 		functionTimer.enterFunction("Create geotagged XMP sidecar files using GPX file"))
@@ -872,24 +920,18 @@ func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpx
 	// oh cute. Range actually creates a COPY of every element from its array. Meaning any modifications
 	//		to values inside it aren't gonna be reflected outside the loop
 	for i, sourceFile := range sourceFiles {
-		trackEntries := parsedGpxfile.PositionAt(sourceFile.Timestamp)
-		if len(trackEntries) > 1 {
-			fmt.Printf("WARN: somehow got multiple geotag position results for image %s, bailing on geotag",
-				sourceFile.Paths.RelativePath)
-			continue
-		}
 
-		if len(trackEntries) == 0 {
-			fmt.Printf("\tINFO: could not geotag image %s (image time not found in GPX tracks)\n",
+		gpsPoint := gpxPointFromTimestamp(sourceFile.Timestamp, parsedGpxfile)
+
+		if gpsPoint == nil {
+			fmt.Printf("\t\tCould not geotag image %s, skipping\n",
 				sourceFile.Paths.RelativePath)
 			continue
 		}
+		//fmt.Printf("\t\tGeotag for %s: (%.5f, %.5f), %.1f m ASL\n",
+		//	sourceFile.BaseFilename, gpsPoint.Latitude, gpsPoint.Longitude, gpsPoint.Elevation.Value())
 
 		successfulGeotags++
-
-		// Got a single point, which is really what we want
-		trackEntry := trackEntries[0]
-		gpsPoint := trackEntry.Point
 
 		// add to the waitgroup BEFORE we issue work to ensure that Done won't be run before Add, thus causing
 		//		the semaphore to go negative
@@ -897,8 +939,8 @@ func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpx
 
 		// Record geotag -- note we have to use the array version as otherwise it's not gonna update outside
 		//		the loop
-		sourceFiles[i].GeotaggedLocation = gpsPoint
-		sourceFile.GeotaggedLocation = gpsPoint
+		sourceFiles[i].GeotaggedLocation = *gpsPoint
+		sourceFile.GeotaggedLocation = *gpsPoint
 
 		// Write the XMP file that will contain the geotag
 		inputDir := filepath.Dir(sourceFile.Paths.AbsolutePath)
@@ -917,7 +959,7 @@ func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpx
 	// Wait for workers to cleanly terminate
 	wg.Wait()
 
-	fmt.Printf("\tGeotagging complete; created geotagged XMP sidecars for %d of %d source files\n",
+	fmt.Printf("\n\tGeotagging complete; created geotagged XMP sidecars for %d of %d source files\n",
 		successfulGeotags, len(sourceFiles))
 }
 
