@@ -523,8 +523,6 @@ func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.Wait
 			if inputFileInfo.xmpFilename != "" {
 				writersWg.Add(1)
 				go doXmpCopy(inputFileInfo.xmpFilename, currDestfilePath, writersWg)
-			} else {
-				fmt.Println("No XMP file?!?!?")
 			}
 		}
 
