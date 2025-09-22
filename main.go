@@ -4,10 +4,6 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"github.com/akamensky/argparse"
-	"github.com/barasher/go-exiftool"
-	"github.com/tkrajina/gpxgo/gpx"
-	"golang.org/x/crypto/sha3"
 	"log"
 	"os"
 	"os/exec"
@@ -16,6 +12,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/akamensky/argparse"
+	"github.com/barasher/go-exiftool"
+	"github.com/tkrajina/gpxgo/gpx"
+	"golang.org/x/crypto/sha3"
 )
 
 type ProgramOptions struct {
@@ -23,7 +24,7 @@ type ProgramOptions struct {
 	UtcOffsetHours       int      `json:"utc_offset_hours"`
 	FilenameExtension    string   `json:"filename_extension"`
 	QueueLength          int      `json:"queue_length"`
-	GpxFile              *os.File `json:"gpx_file"`
+	GpxFilename          string   `json:"gpx_filename"`
 	SourceDirs           []string `json:"source_dirs"`
 	DestinationLocations []string `json:"destination_dirs"`
 }
@@ -96,10 +97,10 @@ func parseArgs() ProgramOptions {
 		Default:  0,
 	})
 
-	gpxFile := parser.File("g", "gpxfile", 0, 0444, &argparse.Options{
+	gpxFile := parser.String("g", "gpxfile", &argparse.Options{
 		Required: false,
 		Help:     "Optional GPX file to geotag RAW files",
-		Default:  nil,
+		Default:  "",
 	})
 
 	requiredSourcedir := parser.StringPositional(&argparse.Options{
@@ -173,16 +174,10 @@ func parseArgs() ProgramOptions {
 		DebugMode:            *debugMode,
 		UtcOffsetHours:       *timestampUtcOffsetHours,
 		FilenameExtension:    *filenameExtension,
-		GpxFile:              gpxFile,
+		GpxFilename:          *gpxFile,
 		SourceDirs:           sourceDirs,
 		DestinationLocations: destinationDirs,
 	}
-
-	//jsonBytes, err := json.MarshalIndent(programOpts, "", "    ")
-	//if err != nil {
-	//	panic(err)
-	//}
-	//fmt.Printf("Options:\n%s\n", string(jsonBytes))
 
 	return programOpts
 }
@@ -869,25 +864,12 @@ func gpxPointFromTimestamp(timestamp time.Time, parsedGpxFile *gpx.GPX) *gpx.Poi
 	return &trackSeg.Points[trackSeg.PositionAt(timestamp)].Point
 }
 
-func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpxFile *os.File) {
+func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpxFilename string) {
 	defer functionTimer.exitFunction(
 		functionTimer.enterFunction("Create geotagged XMP sidecar files using GPX file"))
 	fmt.Println("\nCreating geotagged XMP sidecar files using provided GPX file")
 
-	fileInfo, err := gpxFile.Stat()
-
-	if err != nil {
-		panic("Could not get file stats for GPX file")
-	}
-
-	numberOfGpxBytes := fileInfo.Size()
-	gpxBytes := make([]byte, numberOfGpxBytes)
-	_, err = gpxFile.Read(gpxBytes)
-	if err != nil {
-		panic("Could not read GPX file")
-	}
-
-	parsedGpxfile, err := gpx.ParseBytes(gpxBytes)
+	parsedGpxfile, err := gpx.ParseFile(gpxFilename)
 
 	if err != nil {
 		panic("Parsing GPX file contents failed")
@@ -980,8 +962,8 @@ func main() {
 	//			function updates fields in each element of the array we pass down into this function
 	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]], functionTimer)
 
-	if programOpts.GpxFile != nil {
-		geotagSourceImages(foundFiles[programOpts.SourceDirs[0]], functionTimer, programOpts.GpxFile)
+	if programOpts.GpxFilename != "" {
+		geotagSourceImages(foundFiles[programOpts.SourceDirs[0]], functionTimer, programOpts.GpxFilename)
 	}
 
 	doCopyOperations(programOpts, foundFiles, functionTimer)
