@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +22,8 @@ import (
 
 type ProgramOptions struct {
 	DebugMode            bool     `json:"debug_mode"`
-	UtcOffsetHours       int      `json:"utc_offset_hours"`
+	WorkerPoolSize       int      `json:"worker_pool_size"`
+	FailNonMatching      bool     `json:"fail_non_matching"`
 	FilenameExtension    string   `json:"filename_extension"`
 	QueueLength          int      `json:"queue_length"`
 	GpxFilename          string   `json:"gpx_filename"`
@@ -79,22 +81,28 @@ type FileContentsAndChecksumPair struct {
 
 func parseArgs() ProgramOptions {
 	parser := argparse.NewParser("", "Photo end of day script")
-	debugMode := parser.Flag("", "debug", &argparse.Options{
+	debugMode := parser.Flag("v", "verbose", &argparse.Options{
 		Required: false,
-		Help:     "Enable debug output",
+		Help:     "Enable verbose debug output",
 		Default:  false,
 	})
 
-	optionalSourcedirs := parser.StringList("", "additional_sourcedir", &argparse.Options{
+	failNonmatching := parser.Flag("f", "fail-nonmatching", &argparse.Options{
+		Required: false,
+		Help:     "Should we fail entire operation on non matching source files (default: false, meaning ignore/skip)",
+		Default:  false,
+	})
+
+	numWorkers := parser.Int("w", "worker-pool-size", &argparse.Options{
+		Required: false,
+		Help:     "Number of goroutines in worker pool (default:" + strconv.Itoa(runtime.NumCPU()) + ")",
+		Default:  runtime.NumCPU(),
+	})
+
+	optionalSourcedirs := parser.StringList("a", "additional-sourcedir", &argparse.Options{
 		Required: false,
 		Help:     "If there are more than one sourcedir to read from",
 		Default:  nil,
-	})
-
-	timestampUtcOffsetHours := parser.Int("", "timestamp_utc_offset_hours", &argparse.Options{
-		Required: false,
-		Help:     "Hours offset from UTC",
-		Default:  0,
 	})
 
 	gpxFile := parser.String("g", "gpxfile", &argparse.Options{
@@ -172,7 +180,8 @@ func parseArgs() ProgramOptions {
 
 	programOpts := ProgramOptions{
 		DebugMode:            *debugMode,
-		UtcOffsetHours:       *timestampUtcOffsetHours,
+		WorkerPoolSize:       *numWorkers,
+		FailNonMatching:      *failNonmatching,
 		FilenameExtension:    *filenameExtension,
 		GpxFilename:          *gpxFile,
 		SourceDirs:           sourceDirs,
@@ -356,7 +365,8 @@ func getSizeOfOneCopyInBytes(sourcefileList []RawfileInfo, timer *PerfTimer) int
 	return cumulativeBytesInOneCopy
 }
 
-func getRawfileDateTime(sourcefileList []RawfileInfo,
+func getRawfileDateTime(workerPoolSize int,
+	sourcefileList []RawfileInfo,
 	timer *PerfTimer) {
 
 	defer timer.exitFunction(timer.enterFunction("Extracting date info from RAW files"))
@@ -366,7 +376,7 @@ func getRawfileDateTime(sourcefileList []RawfileInfo,
 	sourcefilesNeedingDatetime := make(chan FileDateTimeChannelRequest)
 	extractedDatesChannel := make(chan FileDateTimeChannelEntry)
 
-	for range runtime.NumCPU() {
+	for range workerPoolSize {
 		// Launch goroutines to run Exiftool
 		go getRawfileDateTimeWorker(sourcefilesNeedingDatetime, extractedDatesChannel)
 	}
@@ -408,6 +418,7 @@ func readFileBytesAndChecksum(filePath string, responseChan chan FileContentsAnd
 		hexChecksum,
 	}
 }
+
 func writeFileContents(canonicalFileBytes []byte, currDestfilePath string, wg *sync.WaitGroup) {
 	successfulWrite := false
 	// Create absolute path, open file for binary writing
@@ -466,7 +477,7 @@ func doXmpCopy(sourceXmpAbsolutePath string, destImageFile string, wg *sync.Wait
 	wg.Done()
 }
 
-func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.WaitGroup) {
+func imageFileCopyWorker(programOpts ProgramOptions, workerChannel chan FileCopierRawfileInfo, wg *sync.WaitGroup) {
 
 	for inputFileInfo := range workerChannel {
 
@@ -495,10 +506,17 @@ func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.Wait
 			}
 		}
 
-		// Make sure we only got one input checksum, or we're bailing
-		//fmt.Printf("\t\tChecksums seen: %v\n", checksumsFound)
 		if len(checksumsFound) != 1 {
-			panic("Inconsistent checksums for file " + inputFileInfo.RelativePath)
+			// Skip file or bail
+			if !programOpts.FailNonMatching {
+				fmt.Println("\tWARN: Inconsistent checksums for file " + inputFileInfo.RelativePath + ", skipping")
+				// Note that the work for this input file is complete
+				wg.Done()
+
+				continue
+			} else {
+				panic("Inconsistent checksums for file " + inputFileInfo.RelativePath)
+			}
 		}
 		//fmt.Println("\t\tAll source copies are identical; proceeding with copy logic")
 
@@ -526,7 +544,7 @@ func imageFileCopyWorker(workerChannel chan FileCopierRawfileInfo, wg *sync.Wait
 
 		//fmt.Printf("\t\tSuccessfully wrote %s to all destination directories!\n", uniqueRelativePath)
 
-		// Note that the work for this input file is complete and the function can terminate cleanly
+		// Note that the work for this input file is complete
 		wg.Done()
 
 		//fmt.Printf("\tWork complete on relative path %s\n",
@@ -642,13 +660,14 @@ func doCopyOperations(programOpts ProgramOptions, foundFiles map[string][]Rawfil
 		fmt.Printf("\t\t- %s\n", destDir)
 	}
 
+	fmt.Println()
+
 	workerChan := make(chan FileCopierRawfileInfo)
 
 	// Fire off worker pool
-	numWorkers := runtime.NumCPU()
 	wg := &sync.WaitGroup{}
-	for range numWorkers {
-		go imageFileCopyWorker(workerChan, wg)
+	for range programOpts.WorkerPoolSize {
+		go imageFileCopyWorker(programOpts, workerChan, wg)
 	}
 
 	// Fire off work to the worker pool
@@ -950,6 +969,12 @@ func main() {
 
 	foundFiles := enumerateSourceDirs(programOpts, functionTimer)
 
+	// If we got no files, bail out
+	if len(foundFiles) == 0 {
+		fmt.Println("\nNo input files, bailing")
+		return
+	}
+
 	// Make sure all file lists are identical
 	if confirmIdenticalFilelists(foundFiles, functionTimer) == false {
 		panic("File lists are not identical")
@@ -960,7 +985,7 @@ func main() {
 
 	//		NOTE: we're using the fact that the array is passed by reference, because the target
 	//			function updates fields in each element of the array we pass down into this function
-	getRawfileDateTime(foundFiles[programOpts.SourceDirs[0]], functionTimer)
+	getRawfileDateTime(programOpts.WorkerPoolSize, foundFiles[programOpts.SourceDirs[0]], functionTimer)
 
 	if programOpts.GpxFilename != "" {
 		geotagSourceImages(foundFiles[programOpts.SourceDirs[0]], functionTimer, programOpts.GpxFilename)
