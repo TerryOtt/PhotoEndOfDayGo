@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	"github.com/akamensky/argparse"
-	"github.com/barasher/go-exiftool"
 	"github.com/tkrajina/gpxgo/gpx"
 	"golang.org/x/crypto/sha3"
 )
@@ -51,16 +49,6 @@ type PathInfo struct {
 type EnumerationChannelInfo struct {
 	sourcedir  string
 	foundFiles []RawfileInfo
-}
-
-type FileDateTimeChannelRequest struct {
-	sourcedirIndex int
-	absolutePath   string
-}
-
-type FileDateTimeChannelEntry struct {
-	sourcedirIndex int
-	fileDateTime   time.Time
 }
 
 type FileCopierRawfileInfo struct {
@@ -274,78 +262,8 @@ func confirmIdenticalFilelists(foundFiles map[string][]RawfileInfo, timer *PerfT
 	return true
 }
 
-func parseExifDate(exifDateTime string) time.Time {
-	var year int
-	var month int
-	var day int
-	var hour int
-	var minute int
-	var second int
-	const ns int = 0
-	timeLoc := time.UTC
-
-	//fmt.Printf("Got exif datetime %s, parsing with sScanf\n", exifDateTime)
-
-	_, err := fmt.Sscanf(exifDateTime, "%d:%d:%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second)
-
-	//fmt.Println("Back from scanf")
-
-	if err != nil {
-		panic(err)
-	}
-
-	returnTime := time.Date(year, time.Month(month), day, hour, minute, second, ns, timeLoc)
-
-	return returnTime
-}
-
 func iso8601Datetime(timeToFormat time.Time) string {
 	return timeToFormat.Format(time.DateTime + "Z")
-}
-
-func getRawfileDateTimeWorker(incomingSourcefiles chan FileDateTimeChannelRequest,
-	responseChan chan FileDateTimeChannelEntry) {
-
-	et, err := exiftool.NewExiftool()
-	if err != nil {
-		fmt.Printf("Error when initializing ExifTool: %v\n", err)
-		return
-	}
-	defer et.Close()
-
-	// "range" will iterate reading over the channel until the channel is empty and closed
-	for currDateTimeRequest := range incomingSourcefiles {
-		//fmt.Printf("\tGot incoming file index %5d, path: %s, \n", currDateTimeRequest.sourcedirIndex,
-		//	currDateTimeRequest.absolutePath)
-
-		rawFileInfo := et.ExtractMetadata(currDateTimeRequest.absolutePath)
-
-		//fmt.Printf("File %s has %d sections of info\n", currDateTimeRequest.absolutePath, len(rawFileInfo))
-
-		// Read all sections of rawfile info
-		for _, currRawfileInfoEntry := range rawFileInfo {
-			if currRawfileInfoEntry.Err != nil {
-				fmt.Printf("Error concerning %v: %v\n", currRawfileInfoEntry.File, currRawfileInfoEntry.Err)
-			}
-
-			// Make sure we have DateTimeOriginal, or shit is fuck
-			if val, ok := currRawfileInfoEntry.Fields["DateTimeOriginal"]; ok {
-				fileDateTime := parseExifDate(val.(string))
-				//fmt.Printf("\tFile index %5d has extracted time %s\n",
-				//	currDateTimeRequest.sourcedirIndex,
-				//	iso8601Datetime(fileDateTime))
-
-				// Send the date/time info back through the response channel
-				extractedDatetime := FileDateTimeChannelEntry{
-					currDateTimeRequest.sourcedirIndex,
-					fileDateTime}
-				responseChan <- extractedDatetime
-				//fmt.Println("Send extracted datetime back through response channel")
-			} else {
-				fmt.Printf("Field 'DateTimeOriginal' is missing\n")
-			}
-		}
-	}
 }
 
 func getSizeOfOneCopyInBytes(sourcefileList []RawfileInfo, timer *PerfTimer) int64 {
@@ -363,46 +281,6 @@ func getSizeOfOneCopyInBytes(sourcefileList []RawfileInfo, timer *PerfTimer) int
 	fmt.Printf("\tSize of RAW files: %.01f GB\n", float64(cumulativeBytesInOneCopy)/(1024*1024*1024))
 
 	return cumulativeBytesInOneCopy
-}
-
-func getRawfileDateTime(workerPoolSize int,
-	sourcefileList []RawfileInfo,
-	timer *PerfTimer) {
-
-	defer timer.exitFunction(timer.enterFunction("Extracting date info from RAW files"))
-
-	fmt.Println("\nGetting date/time of RAW files")
-
-	sourcefilesNeedingDatetime := make(chan FileDateTimeChannelRequest)
-	extractedDatesChannel := make(chan FileDateTimeChannelEntry)
-
-	for range workerPoolSize {
-		// Launch goroutines to run Exiftool
-		go getRawfileDateTimeWorker(sourcefilesNeedingDatetime, extractedDatesChannel)
-	}
-
-	datesToRead := len(sourcefileList)
-	go func() {
-		for i, currFileFromList := range sourcefileList {
-			//fmt.Printf("\tFound file in list %s\n", currFileFromList.Paths.AbsolutePath)
-			// Send (array index, sourcefile path) tuples to worker channel
-			sourcefilesNeedingDatetime <- FileDateTimeChannelRequest{
-				i,
-				currFileFromList.Paths.AbsolutePath}
-		}
-
-		close(sourcefilesNeedingDatetime)
-	}()
-
-	// Read any remaining tuples from the response channel
-	for i := datesToRead; i > 0; i-- {
-		extractedDateInfo := <-extractedDatesChannel
-
-		// Populate the time field of the incoming array at the specified index
-		sourcefileList[extractedDateInfo.sourcedirIndex].Timestamp = extractedDateInfo.fileDateTime
-	}
-
-	fmt.Printf("\tDates extracted successfully from all %d rawfiles\n", len(sourcefileList))
 }
 
 func readFileBytesAndChecksum(filePath string, responseChan chan FileContentsAndChecksumPair) {
@@ -483,6 +361,17 @@ func imageFileCopyWorker(programOpts ProgramOptions, workerChannel chan FileCopi
 
 		//fmt.Printf("\tWork starting on relative path %s\n",
 		//	inputFileInfo.RelativePath)
+
+		// Getting file creation time
+		imageOriginalDatetime, err := GetCR3DatetimeUTC(inputFileInfo.AbsolutePaths[0])
+
+		if err != nil {
+			panic("\tFATAL: could not get EXIF original timestamp for " + inputFileInfo.RelativePath)
+		}
+
+		inputFileInfo.Timestamp = imageOriginalDatetime
+
+		fmt.Println("\tEXIF original timestamp:", inputFileInfo.Timestamp)
 
 		// Map from computed checksum to number of input copies with that checksum
 		checksumsFound := make(map[string]int)
@@ -738,229 +627,229 @@ func printProfilingStats(programOpts ProgramOptions, functionTimer *PerfTimer, b
 	fmt.Printf("\n\t                                               Total   %8.01f   (%.02f minutes)\n", totalSeconds, totalSeconds/60)
 }
 
-func writeExiftoolGpsTagsIntoXmpInfo(geopoint gpx.Point, xmpInfo exiftool.FileMetadata) {
-	//		https://exiftool.org/TagNames/GPS.html
-	//
-	// When adding GPS information to an image, it is important to set all of the following tags:
-	//		- GPSLatitude
-	//		- GPSLatitudeRef
-	//		- GPSLongitude
-	//		- GPSLongitudeRef
-	//		- GPSAltitude & GPSAltitudeRef if the altitude is known.
+//func writeExiftoolGpsTagsIntoXmpInfo(geopoint gpx.Point, xmpInfo exiftool.FileMetadata) {
+//	//		https://exiftool.org/TagNames/GPS.html
+//	//
+//	// When adding GPS information to an image, it is important to set all of the following tags:
+//	//		- GPSLatitude
+//	//		- GPSLatitudeRef
+//	//		- GPSLongitude
+//	//		- GPSLongitudeRef
+//	//		- GPSAltitude & GPSAltitudeRef if the altitude is known.
+//
+//	//fmt.Printf("\t\tLatitude %.05f, longitude %.05f, altitude %.01f m\n",
+//	//	geopoint.Latitude, geopoint.Longitude, geopoint.Elevation.Value())
+//
+//	// GPSLatitude & GPSLatitudeRef
+//	xmpInfo.SetFloat("GPSLatitude", geopoint.Latitude)
+//	var gpsLatitudeRefValue string
+//	if geopoint.Latitude >= 0 {
+//		gpsLatitudeRefValue = "N"
+//	} else {
+//		gpsLatitudeRefValue = "S"
+//	}
+//	xmpInfo.SetString("GPSLatitudeRef", gpsLatitudeRefValue)
+//
+//	// GPSLongitude & GPSLongitudeRef
+//	xmpInfo.SetFloat("GPSLongitude", geopoint.Longitude)
+//	var gpsLongitudeRefValue string
+//	if geopoint.Longitude < 0 {
+//		gpsLongitudeRefValue = "W"
+//	} else {
+//		gpsLongitudeRefValue = "E"
+//	}
+//	xmpInfo.SetString("GPSLongitudeRef", gpsLongitudeRefValue)
+//
+//	// GPSAltitude & GPSAltitudeRef (optional)
+//	if geopoint.Elevation.NotNull() {
+//		xmpInfo.SetFloat("GPSAltitude", geopoint.Elevation.Value())
+//		// GPSAltitudeRef is 0 for "above sea level
+//		gpsAltitudeRef := int64(0)
+//		xmpInfo.SetInt("GPSAltitudeRef", gpsAltitudeRef)
+//	}
+//}
 
-	//fmt.Printf("\t\tLatitude %.05f, longitude %.05f, altitude %.01f m\n",
-	//	geopoint.Latitude, geopoint.Longitude, geopoint.Elevation.Value())
+//func geotagXmpWriterWorker(geotagWriteChannel chan RawfileInfo, wg *sync.WaitGroup) {
+//	// Sadly we can't run arbitrary exiftool commands through our exiftool wrapper like you can
+//	//		in the python version
+//
+//	et, err := exiftool.NewExiftool()
+//	if err != nil {
+//		fmt.Printf("Error when initializing ExifTool: %v\n", err)
+//		return
+//	}
+//
+//	// Range on a channel will repeatedly read until channel is empty AND channel is closed by sender
+//	for geotaggedSourceFile := range geotagWriteChannel {
+//		//fmt.Printf("\tCreating XMP with geotag for rawfile %s\n", geotaggedSourceFile.Paths.AbsolutePath)
+//
+//		xmpFilename := geotaggedSourceFile.absoluteXmpFileWithGeotag
+//
+//		// Create non-geotagged XMP .
+//		//fmt.Printf("\t\tXMP filename %s\n", xmpFilename)
+//		exiftoolArgs := []string{
+//			geotaggedSourceFile.Paths.AbsolutePath,
+//			"-o",
+//			xmpFilename,
+//		}
+//
+//		cmd := exec.Command("exiftool", exiftoolArgs...)
+//		if err := cmd.Run(); err != nil {
+//			fmt.Printf("\t\t\tError running exiftool: %v\n", err)
+//		}
+//
+//		// Read the generated XMP metadata in
+//		xmpInfoArray := et.ExtractMetadata(xmpFilename)
+//
+//		//for _, currInfo := range xmpInfoArray {
+//		//	if currInfo.Err != nil {
+//		//		fmt.Printf("Got an error from exiftool metadata: %v\n", currInfo.Err)
+//		//	}
+//		//
+//		//	fmt.Printf("\t\tnew file info section\n")
+//		//
+//		//	for k, v := range currInfo.Fields {
+//		//		fmt.Printf("\t\t\t%v = %v\n", k, v)
+//		//	}
+//		//}
+//
+//		// Insert geo tag metadata
+//		writeExiftoolGpsTagsIntoXmpInfo(geotaggedSourceFile.GeotaggedLocation, xmpInfoArray[0])
+//
+//		// Write newly-geotagged metadata to the XMP file
+//		et.WriteMetadata(xmpInfoArray)
+//
+//		// can mark one channel read complete
+//		wg.Done()
+//	}
+//
+//	if err := et.Close(); err != nil {
+//		fmt.Printf("Error when closing exiftool: %v\n", err)
+//	}
+//}
 
-	// GPSLatitude & GPSLatitudeRef
-	xmpInfo.SetFloat("GPSLatitude", geopoint.Latitude)
-	var gpsLatitudeRefValue string
-	if geopoint.Latitude >= 0 {
-		gpsLatitudeRefValue = "N"
-	} else {
-		gpsLatitudeRefValue = "S"
-	}
-	xmpInfo.SetString("GPSLatitudeRef", gpsLatitudeRefValue)
+//func gpxPointFromTimestamp(timestamp time.Time, parsedGpxFile *gpx.GPX) *gpx.Point {
+//	gpxTimeBounds := parsedGpxFile.TimeBounds()
+//
+//	// Make sure the file datetime is in the start/end time range of our GPX file
+//	if timestamp.Before(gpxTimeBounds.StartTime) || timestamp.After(gpxTimeBounds.EndTime) {
+//		return nil
+//	}
+//
+//	// Identify exactly which track and segment inside the GPX our image timestamp falls within
+//	correctTrack := -1
+//	for i, currTrack := range parsedGpxFile.Tracks {
+//		if timestamp.Before(currTrack.TimeBounds().StartTime) ||
+//			timestamp.After(currTrack.TimeBounds().EndTime) {
+//
+//			continue
+//		}
+//		correctTrack = i
+//		break
+//	}
+//	if correctTrack == -1 {
+//		return nil
+//	}
+//
+//	// Find correct track segment within our track
+//	correctTrackSegment := -1
+//	for i, currTrackSegment := range parsedGpxFile.Tracks[correctTrack].Segments {
+//		if timestamp.Before(currTrackSegment.TimeBounds().StartTime) ||
+//			timestamp.After(currTrackSegment.TimeBounds().EndTime) {
+//
+//			continue
+//		}
+//
+//		correctTrackSegment = i
+//		break
+//	}
+//	if correctTrackSegment == -1 {
+//		return nil
+//	}
+//
+//	trackSeg := parsedGpxFile.Tracks[correctTrack].Segments[correctTrackSegment]
+//
+//	return &trackSeg.Points[trackSeg.PositionAt(timestamp)].Point
+//}
 
-	// GPSLongitude & GPSLongitudeRef
-	xmpInfo.SetFloat("GPSLongitude", geopoint.Longitude)
-	var gpsLongitudeRefValue string
-	if geopoint.Longitude < 0 {
-		gpsLongitudeRefValue = "W"
-	} else {
-		gpsLongitudeRefValue = "E"
-	}
-	xmpInfo.SetString("GPSLongitudeRef", gpsLongitudeRefValue)
-
-	// GPSAltitude & GPSAltitudeRef (optional)
-	if geopoint.Elevation.NotNull() {
-		xmpInfo.SetFloat("GPSAltitude", geopoint.Elevation.Value())
-		// GPSAltitudeRef is 0 for "above sea level
-		gpsAltitudeRef := int64(0)
-		xmpInfo.SetInt("GPSAltitudeRef", gpsAltitudeRef)
-	}
-}
-
-func geotagXmpWriterWorker(geotagWriteChannel chan RawfileInfo, wg *sync.WaitGroup) {
-	// Sadly we can't run arbitrary exiftool commands through our exiftool wrapper like you can
-	//		in the python version
-
-	et, err := exiftool.NewExiftool()
-	if err != nil {
-		fmt.Printf("Error when initializing ExifTool: %v\n", err)
-		return
-	}
-
-	// Range on a channel will repeatedly read until channel is empty AND channel is closed by sender
-	for geotaggedSourceFile := range geotagWriteChannel {
-		//fmt.Printf("\tCreating XMP with geotag for rawfile %s\n", geotaggedSourceFile.Paths.AbsolutePath)
-
-		xmpFilename := geotaggedSourceFile.absoluteXmpFileWithGeotag
-
-		// Create non-geotagged XMP .
-		//fmt.Printf("\t\tXMP filename %s\n", xmpFilename)
-		exiftoolArgs := []string{
-			geotaggedSourceFile.Paths.AbsolutePath,
-			"-o",
-			xmpFilename,
-		}
-
-		cmd := exec.Command("exiftool", exiftoolArgs...)
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("\t\t\tError running exiftool: %v\n", err)
-		}
-
-		// Read the generated XMP metadata in
-		xmpInfoArray := et.ExtractMetadata(xmpFilename)
-
-		//for _, currInfo := range xmpInfoArray {
-		//	if currInfo.Err != nil {
-		//		fmt.Printf("Got an error from exiftool metadata: %v\n", currInfo.Err)
-		//	}
-		//
-		//	fmt.Printf("\t\tnew file info section\n")
-		//
-		//	for k, v := range currInfo.Fields {
-		//		fmt.Printf("\t\t\t%v = %v\n", k, v)
-		//	}
-		//}
-
-		// Insert geo tag metadata
-		writeExiftoolGpsTagsIntoXmpInfo(geotaggedSourceFile.GeotaggedLocation, xmpInfoArray[0])
-
-		// Write newly-geotagged metadata to the XMP file
-		et.WriteMetadata(xmpInfoArray)
-
-		// can mark one channel read complete
-		wg.Done()
-	}
-
-	if err := et.Close(); err != nil {
-		fmt.Printf("Error when closing exiftool: %v\n", err)
-	}
-}
-
-func gpxPointFromTimestamp(timestamp time.Time, parsedGpxFile *gpx.GPX) *gpx.Point {
-	gpxTimeBounds := parsedGpxFile.TimeBounds()
-
-	// Make sure the file datetime is in the start/end time range of our GPX file
-	if timestamp.Before(gpxTimeBounds.StartTime) || timestamp.After(gpxTimeBounds.EndTime) {
-		return nil
-	}
-
-	// Identify exactly which track and segment inside the GPX our image timestamp falls within
-	correctTrack := -1
-	for i, currTrack := range parsedGpxFile.Tracks {
-		if timestamp.Before(currTrack.TimeBounds().StartTime) ||
-			timestamp.After(currTrack.TimeBounds().EndTime) {
-
-			continue
-		}
-		correctTrack = i
-		break
-	}
-	if correctTrack == -1 {
-		return nil
-	}
-
-	// Find correct track segment within our track
-	correctTrackSegment := -1
-	for i, currTrackSegment := range parsedGpxFile.Tracks[correctTrack].Segments {
-		if timestamp.Before(currTrackSegment.TimeBounds().StartTime) ||
-			timestamp.After(currTrackSegment.TimeBounds().EndTime) {
-
-			continue
-		}
-
-		correctTrackSegment = i
-		break
-	}
-	if correctTrackSegment == -1 {
-		return nil
-	}
-
-	trackSeg := parsedGpxFile.Tracks[correctTrack].Segments[correctTrackSegment]
-
-	return &trackSeg.Points[trackSeg.PositionAt(timestamp)].Point
-}
-
-func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpxFilename string) {
-	defer functionTimer.exitFunction(
-		functionTimer.enterFunction("Create geotagged XMP sidecar files using GPX file"))
-	fmt.Println("\nCreating geotagged XMP sidecar files using provided GPX file")
-
-	parsedGpxfile, err := gpx.ParseFile(gpxFilename)
-
-	if err != nil {
-		panic("Parsing GPX file contents failed")
-	}
-
-	fmt.Printf("\tSuccessfully parsed GPX file\n\t\tStart time: %s\n\t\t  End time: %s\n",
-		iso8601Datetime(parsedGpxfile.TimeBounds().StartTime),
-		iso8601Datetime(parsedGpxfile.TimeBounds().EndTime))
-
-	//fmt.Println(parsedGpxfile.GetGpxInfo())
-
-	successfulGeotags := 0
-
-	// Use workers that launch Exiftool and write geotags into rawfiles to make Lightroom import cleaner
-	//		Buffered channel to ensure writer never blocks
-	geotagWriteChannel := make(chan RawfileInfo, successfulGeotags)
-
-	numWorkers := runtime.NumCPU()
-	//numWorkers := 1
-	wg := &sync.WaitGroup{}
-	for range numWorkers {
-		go geotagXmpWriterWorker(geotagWriteChannel, wg)
-	}
-
-	// Iterate through all the files and geotag them -- could be parallelized, but no need,
-	//		it's crazy fast even in a single thread
-
-	// oh cute. Range actually creates a COPY of every element from its array. Meaning any modifications
-	//		to values inside it aren't gonna be reflected outside the loop
-	for i, sourceFile := range sourceFiles {
-
-		gpsPoint := gpxPointFromTimestamp(sourceFile.Timestamp, parsedGpxfile)
-
-		if gpsPoint == nil {
-			fmt.Printf("\t\tINFO: unable to geotag image %s with GPX file provided\n",
-				sourceFile.Paths.RelativePath)
-			continue
-		}
-		//fmt.Printf("\t\tGeotag for %s: (%.5f, %.5f), %.1f m ASL\n",
-		//	sourceFile.BaseFilename, gpsPoint.Latitude, gpsPoint.Longitude, gpsPoint.Elevation.Value())
-
-		successfulGeotags++
-
-		// add to the waitgroup BEFORE we issue work to ensure that Done won't be run before Add, thus causing
-		//		the semaphore to go negative
-		wg.Add(1)
-
-		// Record geotag -- note we have to use the array version as otherwise it's not gonna update outside
-		//		the loop
-		sourceFiles[i].GeotaggedLocation = *gpsPoint
-		sourceFile.GeotaggedLocation = *gpsPoint
-
-		// Write the XMP file that will contain the geotag
-		inputDir := filepath.Dir(sourceFile.Paths.AbsolutePath)
-		xmpFilename := inputDir + string(os.PathSeparator) + sourceFile.BaseFilename +
-			".xmp"
-		sourceFiles[i].absoluteXmpFileWithGeotag = xmpFilename
-		sourceFile.absoluteXmpFileWithGeotag = xmpFilename
-
-		// Write sourcefile that we geotagged
-		geotagWriteChannel <- sourceFile
-	}
-
-	// Close the channel to signal to workers all writes are done
-	close(geotagWriteChannel)
-
-	// Wait for workers to cleanly terminate
-	wg.Wait()
-
-	fmt.Printf("\n\tGeotagging complete; created geotagged XMP sidecars for %d of %d source files\n",
-		successfulGeotags, len(sourceFiles))
-}
+//func geotagSourceImages(sourceFiles []RawfileInfo, functionTimer *PerfTimer, gpxFilename string) {
+//	defer functionTimer.exitFunction(
+//		functionTimer.enterFunction("Create geotagged XMP sidecar files using GPX file"))
+//	fmt.Println("\nCreating geotagged XMP sidecar files using provided GPX file")
+//
+//	parsedGpxfile, err := gpx.ParseFile(gpxFilename)
+//
+//	if err != nil {
+//		panic("Parsing GPX file contents failed")
+//	}
+//
+//	fmt.Printf("\tSuccessfully parsed GPX file\n\t\tStart time: %s\n\t\t  End time: %s\n",
+//		iso8601Datetime(parsedGpxfile.TimeBounds().StartTime),
+//		iso8601Datetime(parsedGpxfile.TimeBounds().EndTime))
+//
+//	//fmt.Println(parsedGpxfile.GetGpxInfo())
+//
+//	successfulGeotags := 0
+//
+//	// Use workers that launch Exiftool and write geotags into rawfiles to make Lightroom import cleaner
+//	//		Buffered channel to ensure writer never blocks
+//	geotagWriteChannel := make(chan RawfileInfo, successfulGeotags)
+//
+//	numWorkers := runtime.NumCPU()
+//	//numWorkers := 1
+//	wg := &sync.WaitGroup{}
+//	for range numWorkers {
+//		go geotagXmpWriterWorker(geotagWriteChannel, wg)
+//	}
+//
+//	// Iterate through all the files and geotag them -- could be parallelized, but no need,
+//	//		it's crazy fast even in a single thread
+//
+//	// oh cute. Range actually creates a COPY of every element from its array. Meaning any modifications
+//	//		to values inside it aren't gonna be reflected outside the loop
+//	for i, sourceFile := range sourceFiles {
+//
+//		gpsPoint := gpxPointFromTimestamp(sourceFile.Timestamp, parsedGpxfile)
+//
+//		if gpsPoint == nil {
+//			fmt.Printf("\t\tINFO: unable to geotag image %s with GPX file provided\n",
+//				sourceFile.Paths.RelativePath)
+//			continue
+//		}
+//		//fmt.Printf("\t\tGeotag for %s: (%.5f, %.5f), %.1f m ASL\n",
+//		//	sourceFile.BaseFilename, gpsPoint.Latitude, gpsPoint.Longitude, gpsPoint.Elevation.Value())
+//
+//		successfulGeotags++
+//
+//		// add to the waitgroup BEFORE we issue work to ensure that Done won't be run before Add, thus causing
+//		//		the semaphore to go negative
+//		wg.Add(1)
+//
+//		// Record geotag -- note we have to use the array version as otherwise it's not gonna update outside
+//		//		the loop
+//		sourceFiles[i].GeotaggedLocation = *gpsPoint
+//		sourceFile.GeotaggedLocation = *gpsPoint
+//
+//		// Write the XMP file that will contain the geotag
+//		inputDir := filepath.Dir(sourceFile.Paths.AbsolutePath)
+//		xmpFilename := inputDir + string(os.PathSeparator) + sourceFile.BaseFilename +
+//			".xmp"
+//		sourceFiles[i].absoluteXmpFileWithGeotag = xmpFilename
+//		sourceFile.absoluteXmpFileWithGeotag = xmpFilename
+//
+//		// Write sourcefile that we geotagged
+//		geotagWriteChannel <- sourceFile
+//	}
+//
+//	// Close the channel to signal to workers all writes are done
+//	close(geotagWriteChannel)
+//
+//	// Wait for workers to cleanly terminate
+//	wg.Wait()
+//
+//	fmt.Printf("\n\tGeotagging complete; created geotagged XMP sidecars for %d of %d source files\n",
+//		successfulGeotags, len(sourceFiles))
+//}
 
 func main() {
 	programOpts := parseArgs()
@@ -983,15 +872,9 @@ func main() {
 	sizeOfOneCopyOfAllImages := getSizeOfOneCopyInBytes(foundFiles[programOpts.SourceDirs[0]],
 		functionTimer)
 
-	//		NOTE: we're using the fact that the array is passed by reference, because the target
-	//			function updates fields in each element of the array we pass down into this function
-	getRawfileDateTime(programOpts.WorkerPoolSize, foundFiles[programOpts.SourceDirs[0]], functionTimer)
-
-	if programOpts.GpxFilename != "" {
-		geotagSourceImages(foundFiles[programOpts.SourceDirs[0]], functionTimer, programOpts.GpxFilename)
-	}
-
 	doCopyOperations(programOpts, foundFiles, functionTimer)
+
+	// TODO: If there's a GPX file in the options, create XMP with geotag and write to all destinations
 
 	printProfilingStats(programOpts, functionTimer, sizeOfOneCopyOfAllImages)
 }
