@@ -4,7 +4,6 @@ go 1.24.0
 
 require (
 	github.com/akamensky/argparse v1.4.0
-	github.com/barasher/go-exiftool v1.10.0
 	github.com/evanoberholster/imagemeta v0.3.1
 	github.com/google/uuid v1.6.0
 	github.com/tkrajina/gpxgo v1.4.0
