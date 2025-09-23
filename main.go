@@ -371,7 +371,7 @@ func imageFileCopyWorker(programOpts ProgramOptions, workerChannel chan FileCopi
 
 		inputFileInfo.Timestamp = imageOriginalDatetime
 
-		fmt.Println("\tEXIF original timestamp:", inputFileInfo.Timestamp)
+		//fmt.Println("\tEXIF original timestamp:", inputFileInfo.Timestamp)
 
 		// Map from computed checksum to number of input copies with that checksum
 		checksumsFound := make(map[string]int)
@@ -615,7 +615,7 @@ func printProfilingStats(programOpts ProgramOptions, functionTimer *PerfTimer, b
 		sourceCopies+(destCopies*2), totalGB, totalGB/totalSeconds)
 
 	fmt.Println("\n\t                     Operation                         Time (s)    % of Total Time")
-	fmt.Println("\t----------------------------------------------------   --------   ---------------")
+	fmt.Println("\t----------------------------------------------------   --------    ---------------")
 	for _, currOpTime := range timerInfo.operationTimes {
 		currSec := currOpTime.duration.Seconds()
 		percentageTime := currSec / timerInfo.cumulativeTime.Seconds() * 100.0
