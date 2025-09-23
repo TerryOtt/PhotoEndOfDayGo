@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,13 +76,13 @@ func parseArgs() ProgramOptions {
 
 	failNonmatching := parser.Flag("f", "fail-nonmatching", &argparse.Options{
 		Required: false,
-		Help:     "Should we fail entire operation on non matching source files (default: false, meaning ignore/skip)",
+		Help:     "Should we fail entire operation on non matching source files (default: ignore/skip)",
 		Default:  false,
 	})
 
 	numWorkers := parser.Int("w", "worker-pool-size", &argparse.Options{
 		Required: false,
-		Help:     "Number of goroutines in worker pool (default:" + strconv.Itoa(runtime.NumCPU()) + ")",
+		Help:     "Number of goroutines in worker pool",
 		Default:  runtime.NumCPU(),
 	})
 
